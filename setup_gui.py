@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import subprocess
+import json
 from pathlib import Path
 
 from flask import Flask, request, render_template_string, redirect, url_for
@@ -24,22 +25,118 @@ DEFAULT_CONFIG = {
     },
     "sync": {
         "enable_sync": False,
-        "unraid_ip": "192.168.0.139",
-        "share_path_audio": "/data/media/audiobook",
-        "share_path_books": "/data/media/calibre",
+        "server_ip": "192.168.0.139",
+        "server_path_audio": "/data/media/audiobook",
+        "server_path_books": "/data/media/calibre",
     },
 }
+
 
 def load_config():
     if CONFIG_PATH.exists():
         with CONFIG_PATH.open("r") as f:
             return yaml.safe_load(f)
-    return DEFAULT_CONFIG.copy()
+    # deep copy-ish
+    cfg = yaml.safe_load(yaml.safe_dump(DEFAULT_CONFIG))
+    return cfg
+
 
 def save_config(cfg):
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with CONFIG_PATH.open("w") as f:
         yaml.safe_dump(cfg, f)
+
+
+def get_storage_devices():
+    """
+    Detect removable partitions that look like good candidates for media.
+    We intentionally skip the internal mmcblk0 (SD card/root).
+    """
+    devices = []
+    try:
+        out = subprocess.check_output(
+            ["lsblk", "-J", "-o", "NAME,SIZE,FSTYPE,MOUNTPOINT,TYPE,RM"],
+            text=True,
+        )
+        data = json.loads(out)
+
+        def visit(node):
+            t = node.get("type")
+            name = node.get("name")
+            rm = node.get("rm", 0)
+            mp = node.get("mountpoint")
+            size = node.get("size")
+            fstype = node.get("fstype")
+            if "children" in node:
+                for ch in node["children"]:
+                    visit(ch)
+            if (
+                t == "part"
+                and name
+                and not name.startswith("mmcblk0")
+                and str(rm) in ("1", "true", "True")
+            ):
+                devpath = f"/dev/{name}"
+                devices.append(
+                    {
+                        "path": devpath,
+                        "size": size or "?",
+                        "fstype": fstype or "",
+                        "mountpoint": mp or "",
+                    }
+                )
+
+        for dev in data.get("blockdevices", []):
+            visit(dev)
+    except Exception:
+        pass
+    return devices
+
+
+def format_and_mount_device(device, mountpoint, fstype="ext4"):
+    """
+    EXTREMELY DESTRUCTIVE: formats the given device as ext4 and mounts it
+    at the given mountpoint. Also creates a systemd mount unit so it
+    auto-mounts on boot.
+    """
+    if not device.startswith("/dev/"):
+        return
+    if "mmcblk0" in device:
+        # Never touch the system SD card
+        return
+
+    mountpoint = Path(mountpoint)
+    mountpoint.mkdir(parents=True, exist_ok=True)
+
+    # Try to unmount if currently mounted
+    subprocess.run(["umount", device], check=False)
+
+    # Make ext4 filesystem
+    subprocess.run(["mkfs.ext4", "-F", device], check=True)
+
+    # Mount now
+    subprocess.run(["mount", device, str(mountpoint)], check=True)
+
+    # Create systemd mount unit (e.g. /mnt/media -> mnt-media.mount)
+    unit_name = mountpoint.as_posix().lstrip("/").replace("/", "-") + ".mount"
+    unit_path = Path("/etc/systemd/system") / unit_name
+    unit_content = f"""[Unit]
+Description=Lusty Library media ({device})
+After=local-fs.target
+
+[Mount]
+What={device}
+Where={mountpoint}
+Type={fstype}
+Options=defaults
+
+[Install]
+WantedBy=multi-user.target
+"""
+    unit_path.write_text(unit_content)
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "enable", "--now", unit_name], check=False)
+
 
 def generate_docker_compose(cfg):
     """Generate a docker-compose.yml based on selected options."""
@@ -88,8 +185,6 @@ def generate_docker_compose(cfg):
             "",
         ]
 
-    # You can add the Request app here later, same pattern
-
     compose_path = Path("/home/pi/library-server")
     compose_path.mkdir(parents=True, exist_ok=True)
     with (compose_path / "docker-compose.yml").open("w") as f:
@@ -101,10 +196,11 @@ def generate_docker_compose(cfg):
 
     return compose_path / "docker-compose.yml"
 
+
 def apply_wifi_config(cfg):
     """
-    Minimal example: update hostapd SSID/password and dhcpcd static IP.
-    You can extend this to write RaspAP config files if you want.
+    Update hostapd SSID/password and dhcpcd static IP for wlan0.
+    Assumes RaspAP/hostapd already installed.
     """
     ssid = cfg["wifi"]["ssid"]
     password = cfg["wifi"]["password"]
@@ -155,36 +251,36 @@ def apply_wifi_config(cfg):
         except Exception:
             pass
 
+
 def apply_sync_config(cfg):
     """
-    Writes a basic sync_from_unraid.sh based on config.
-    You can plug in your full sync script here.
+    Writes a basic sync_from_server.sh script based on config.
     """
     if not cfg["sync"]["enable_sync"]:
         return
 
     media_root = cfg["storage"]["media_root"]
-    unraid_ip = cfg["sync"]["unraid_ip"]
-    share_audio = cfg["sync"]["share_path_audio"]
-    share_books = cfg["sync"]["share_path_books"]
+    server_ip = cfg["sync"]["server_ip"]
+    path_audio = cfg["sync"]["server_path_audio"]
+    path_books = cfg["sync"]["server_path_books"]
 
     script = f"""#!/bin/bash
 set -euo pipefail
 
-UNRAID_IP="{unraid_ip}"
-UNRAID_SHARE="//{unraid_ip}/data"
-MOUNT_POINT="/mnt/unraid_data"
+SERVER_IP="{server_ip}"
+SERVER_SHARE="//{server_ip}/data"
+MOUNT_POINT="/mnt/remote_data"
 
-SRC_AUDIO="${{MOUNT_POINT}}{share_audio}"
-SRC_BOOKS="${{MOUNT_POINT}}{share_books}"
+SRC_AUDIO="${{MOUNT_POINT}}{path_audio}"
+SRC_BOOKS="${{MOUNT_POINT}}{path_books}"
 
 DST_AUDIO="{media_root}/audiobooks/"
 DST_BOOKS="{media_root}/books/"
 
 CIFS_OPTS="guest,vers=3.0,iocharset=utf8,noperm,uid=1000,gid=1000"
 
-LOG="/var/log/sync_from_unraid.log"
-LOCK="/run/sync_from_unraid.lock"
+LOG="/var/log/sync_from_server.log"
+LOCK="/run/sync_from_server.lock"
 FLAG="/tmp/sync_in_progress"
 
 CARRIER_FILE="/sys/class/net/eth0/carrier"
@@ -201,16 +297,16 @@ flock -n 9 || exit 0
   echo "==== $(date '+%F %T') — sync start ===="
 
   for i in {{1..5}}; do
-    if ping -c1 -W1 "$UNRAID_IP" >/dev/null 2>&1; then
+    if ping -c1 -W1 "$SERVER_IP" >/dev/null 2>&1; then
       break
     fi
     sleep 3
   done
 
   if ! mountpoint -q "$MOUNT_POINT"; then
-    echo "Mounting $UNRAID_SHARE -> $MOUNT_POINT"
+    echo "Mounting $SERVER_SHARE -> $MOUNT_POINT"
     mkdir -p "$MOUNT_POINT"
-    mount -t cifs "$UNRAID_SHARE" "$MOUNT_POINT" -o "$CIFS_OPTS" || {{
+    mount -t cifs "$SERVER_SHARE" "$MOUNT_POINT" -o "$CIFS_OPTS" || {{
       echo "ERROR: mount failed"
       rm -f "$FLAG"
       exit 0
@@ -219,10 +315,10 @@ flock -n 9 || exit 0
 
   mkdir -p "$DST_AUDIO" "$DST_BOOKS"
 
-  echo "Syncing Audiobooks..."
+  echo "Syncing audiobooks..."
   rsync -av --ignore-existing "$SRC_AUDIO" "$DST_AUDIO" || true
 
-  echo "Syncing Calibre books..."
+  echo "Syncing books..."
   rsync -av --ignore-existing "$SRC_BOOKS" "$DST_BOOKS" || true
 
   if mountpoint -q "$MOUNT_POINT"; then
@@ -234,10 +330,12 @@ flock -n 9 || exit 0
   echo "==== $(date '+%F %T') — sync done ===="
 }} >>"$LOG" 2>&1
 """
-    script_path = Path("/usr/local/bin/sync_from_unraid.sh")
+    script_path = Path("/usr/local/bin/sync_from_server.sh")
     script_path.write_text(script)
     script_path.chmod(0o755)
-    # You can also create/enable the eth0-watcher.service here if desired
+    # NOTE: you already have eth0-watcher + systemd units in your other setup;
+    # you can extend this function to drop those units too.
+
 
 FORM_TEMPLATE = """
 <!doctype html>
@@ -275,17 +373,17 @@ FORM_TEMPLATE = """
         <div class="row">
           <div>
             <label>SSID
-              <input name="wifi_ssid" value="{{ cfg.wifi.ssid }}">
+              <input name="wifi_ssid" value="{{ cfg.wifi.ssid }}" placeholder="e.g. LustyLibrary">
             </label>
           </div>
           <div>
             <label>Password
-              <input name="wifi_password" value="{{ cfg.wifi.password }}">
+              <input name="wifi_password" value="{{ cfg.wifi.password }}" placeholder="e.g. lustybooks123">
             </label>
           </div>
         </div>
         <label>Hotspot IP (wlan0)
-          <input name="wifi_ip" value="{{ cfg.wifi.ip }}">
+          <input name="wifi_ip" value="{{ cfg.wifi.ip }}" placeholder="e.g. 10.10.10.10">
         </label>
         <small>This will update hostapd and dhcpcd for wlan0.</small>
       </fieldset>
@@ -293,9 +391,23 @@ FORM_TEMPLATE = """
       <fieldset>
         <legend>Storage</legend>
         <label>Media root path
-          <input name="media_root" value="{{ cfg.storage.media_root }}">
+          <input name="media_root" value="{{ cfg.storage.media_root }}" placeholder="e.g. /mnt/media">
         </label>
         <small>Subfolders like <code>audiobooks</code>, <code>books</code>, <code>config</code> will be created here.</small>
+
+        <label>Detected storage device to use (optional)
+          <select name="storage_device">
+            <option value="">-- Leave existing storage as-is --</option>
+            {% for d in devices %}
+              <option value="{{ d.path }}">{{ d.path }} ({{ d.size }}, {{ d.fstype or 'unformatted' }}, {% if d.mountpoint %}mounted at {{ d.mountpoint }}{% else %}not mounted{% endif %})</option>
+            {% endfor %}
+          </select>
+        </label>
+        <div class="checkbox-row">
+          <input type="checkbox" id="format_device" name="format_device">
+          <label for="format_device">Format selected device as ext4 and mount at {{ cfg.storage.media_root }} <strong>(⚠ erases all data on that device)</strong></label>
+        </div>
+        <small>If you're already using an attached drive for media, leave the device blank and do not check the format box.</small>
       </fieldset>
 
       <fieldset>
@@ -311,39 +423,39 @@ FORM_TEMPLATE = """
       </fieldset>
 
       <fieldset>
-        <legend>Auto-sync from Unraid (optional)</legend>
+        <legend>Auto-sync from Server (optional)</legend>
         <div class="checkbox-row">
           <input type="checkbox" id="enable_sync" name="enable_sync" {% if cfg.sync.enable_sync %}checked{% endif %}>
-          <label for="enable_sync">Enable auto-sync from Unraid when Ethernet plugged in</label>
+          <label for="enable_sync">Enable auto-sync from server when Ethernet is plugged in</label>
         </div>
         <div class="row">
           <div>
-            <label>Unraid IP
-              <input name="unraid_ip" value="{{ cfg.sync.unraid_ip }}">
+            <label>Server IP
+              <input name="server_ip" value="{{ cfg.sync.server_ip }}" placeholder="e.g. 192.168.0.139">
             </label>
           </div>
         </div>
-        <label>Audiobooks share path on Unraid
-          <input name="share_path_audio" value="{{ cfg.sync.share_path_audio }}">
+        <label>Audiobooks path on server
+          <input name="server_path_audio" value="{{ cfg.sync.server_path_audio }}" placeholder="e.g. /data/media/audiobook">
         </label>
-        <label>Books/Calibre share path on Unraid
-          <input name="share_path_books" value="{{ cfg.sync.share_path_books }}">
+        <label>Books/Calibre path on server
+          <input name="server_path_books" value="{{ cfg.sync.server_path_books }}" placeholder="e.g. /data/media/calibre">
         </label>
-        <small>These are the paths as mounted under the Unraid share root (e.g. <code>/data/media/audiobook</code>).</small>
+        <small>These are the paths as they exist on the remote server share (for example <code>/data/media/audiobook</code>).</small>
       </fieldset>
 
-      <button type="submit">Apply & Generate Config</button>
+      <button type="submit">Apply &amp; Generate Config</button>
     </form>
   </div>
 </body>
 </html>
 """
 
-FORM_TEMPLATE = """..."""
 
 @app.route("/")
 def index():
-    return redirect(url_for("setup")
+    return redirect(url_for("setup"))
+
 
 @app.route("/setup", methods=["GET", "POST"])
 def setup():
@@ -357,6 +469,8 @@ def setup():
 
         # Storage
         cfg["storage"]["media_root"] = request.form.get("media_root", "").strip() or cfg["storage"]["media_root"]
+        storage_device = request.form.get("storage_device", "").strip()
+        format_device = "format_device" in request.form
 
         # Apps
         cfg["apps"]["install_audiobookshelf"] = "install_audiobookshelf" in request.form
@@ -364,11 +478,19 @@ def setup():
 
         # Sync
         cfg["sync"]["enable_sync"] = "enable_sync" in request.form
-        cfg["sync"]["unraid_ip"] = request.form.get("unraid_ip", "").strip() or cfg["sync"]["unraid_ip"]
-        cfg["sync"]["share_path_audio"] = request.form.get("share_path_audio", "").strip() or cfg["sync"]["share_path_audio"]
-        cfg["sync"]["share_path_books"] = request.form.get("share_path_books", "").strip() or cfg["sync"]["share_path_books"]
+        cfg["sync"]["server_ip"] = request.form.get("server_ip", "").strip() or cfg["sync"]["server_ip"]
+        cfg["sync"]["server_path_audio"] = request.form.get("server_path_audio", "").strip() or cfg["sync"]["server_path_audio"]
+        cfg["sync"]["server_path_books"] = request.form.get("server_path_books", "").strip() or cfg["sync"]["server_path_books"]
 
         save_config(cfg)
+
+        # If user selected a device and checked the format box, do the destructive format+mount
+        if storage_device and format_device:
+            try:
+                format_and_mount_device(storage_device, cfg["storage"]["media_root"])
+            except Exception as e:
+                # You could log this to a file if you want
+                print("Error formatting/mounting device:", e)
 
         # Apply configs
         apply_wifi_config(cfg)
@@ -384,7 +506,9 @@ def setup():
         return redirect(url_for("setup"))
 
     # GET
-    return render_template_string(FORM_TEMPLATE, cfg=cfg)
+    devices = get_storage_devices()
+    return render_template_string(FORM_TEMPLATE, cfg=cfg, devices=devices)
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=9000)
