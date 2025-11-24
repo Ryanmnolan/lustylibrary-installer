@@ -339,6 +339,12 @@ FORM_TEMPLATE = """
 </html>
 """
 
+FORM_TEMPLATE = """..."""
+
+@app.route("/")
+def index():
+    return redirect(url_for("setup")
+
 @app.route("/setup", methods=["GET", "POST"])
 def setup():
     cfg = load_config()
