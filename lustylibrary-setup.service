@@ -1,0 +1,14 @@
+[Unit]
+Description=Lusty Library Setup GUI
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 /opt/lustylibrary-installer/setup_gui.py
+WorkingDirectory=/opt/lustylibrary-installer
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
