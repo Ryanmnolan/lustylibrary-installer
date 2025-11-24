@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-REPO_URL="https://github.com/YOURUSER/lustylibrary-installer.git"
+REPO_URL="https://github.com/ryanmnolan/lustylibrary-installer.git"
 INSTALL_DIR="/opt/lustylibrary-installer"
 
 echo "==> Installing Lusty Library Setup Wizard"
