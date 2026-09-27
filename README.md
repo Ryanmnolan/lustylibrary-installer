@@ -12,6 +12,8 @@ It sets up:
 - Optional storage formatting/mounting for an attached USB drive
 - [Audiobookshelf](https://www.audiobookshelf.org/) and/or
   [Calibre-Web](https://github.com/janeczku/calibre-web) via Docker
+- A patron-facing book/audiobook request page on port 5000, saving to a
+  CSV in the media folder
 - Optional one-way sync of audiobooks/books from another server on your
   network, triggered automatically the instant an Ethernet cable is
   plugged in (event-driven — no polling), with optional SMB
@@ -53,6 +55,18 @@ sudo systemctl restart lustylibrary-setup.service
 
 Install log: `/var/log/lustylibrary-install.log`
 Sync log (if enabled): `/var/log/sync_from_server.log`
+
+## Book/audiobook request page
+
+Runs on port 5000 (`http://<pi-ip>:5000/`) as its own systemd service,
+`lustylibrary-requests.service`, separate from the setup wizard on port
+9000. Anyone on the hotspot can submit a title/author/type/notes; each
+request is appended to `requests.csv` in the media folder (e.g.
+`/mnt/media/requests.csv`) and immediately shown in a table on the same
+page, newest first, with a one-click "mark fulfilled" toggle. Writes are
+locked and done via a write-then-rename so concurrent submissions can't
+corrupt the file. Toggle it off in the wizard, or change its port, under
+"Book/Audiobook Requests."
 
 ## Auto-sync trigger
 
@@ -128,5 +142,8 @@ passwordless `sudo` configured for any user.
 
 - The setup wizard has no login and runs as root — only expose port 9000
   on a trusted network.
+- The request page (port 5000) also has no login and its "mark
+  fulfilled" toggle has no confirmation — fine on a private hotspot,
+  not for an open network.
 - `config.yml` (the wizard's own saved settings) stores the Wi-Fi and SMB
   passwords in plain text.

@@ -63,6 +63,10 @@ DEFAULT_CONFIG = {
         "pin": 26,
         "hold_secs": 2.0,
     },
+    "requests_page": {
+        "enabled": True,
+        "port": 5000,
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -136,6 +140,7 @@ STEP_ORDER = [
     ("storage", "Setting up storage"),
     ("docker", "Checking Docker"),
     ("apps", "Installing apps"),
+    ("requests_page", "Setting up the book request page"),
     ("sync", "Configuring auto-sync"),
     ("trigger", "Setting up Ethernet plug-in trigger"),
     ("leds_service", "Installing status LED service"),
@@ -541,6 +546,258 @@ def bring_up_apps(compose_path, step_id):
     if rc != 0:
         log_line(step_id, "'docker compose' plugin unavailable, trying legacy 'docker-compose'...")
         run_cmd(["docker-compose", "-f", str(compose_path), "up", "-d"], step_id)
+
+
+# ---------------------------------------------------------------------------
+# book/audiobook request page (port 5000)
+# ---------------------------------------------------------------------------
+
+REQUESTS_SCRIPT_PATH = Path("/usr/local/bin/library_requests.py")
+REQUESTS_SERVICE_PATH = Path("/etc/systemd/system/lustylibrary-requests.service")
+
+REQUESTS_PAGE_TEMPLATE = '''
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Request a Book</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body { font-family: system-ui, sans-serif; background:#111827; color:#f9fafb; margin:0; }
+    .wrap { max-width:900px; margin:4vh auto; padding:0 16px 40px; }
+    .card { background:#1f2937; padding:24px; border-radius:16px; box-shadow:0 10px 40px rgba(0,0,0,.6); margin-bottom:20px; }
+    h1 { margin-top:0; }
+    label { display:block; margin:8px 0; }
+    input,select,textarea { width:100%; padding:8px; border-radius:6px; border:1px solid #4b5563;
+                   background:#030712; color:#e5e7eb; box-sizing:border-box; font-family:inherit; }
+    .row { display:flex; gap:12px; }
+    .row > div { flex:1; }
+    button { background:#10b981; color:#022c22; border:0; padding:10px 18px; border-radius:999px;
+             font-weight:600; cursor:pointer; margin-top:10px; font-size:15px; }
+    button:hover { background:#059669; }
+    button.secondary { background:#374151; color:#e5e7eb; padding:4px 12px; font-size:13px; margin:0; }
+    button.secondary:hover { background:#4b5563; }
+    table { width:100%; border-collapse:collapse; font-size:14px; }
+    th, td { text-align:left; padding:8px 6px; border-bottom:1px solid #374151; vertical-align:top; }
+    th { color:#9ca3af; font-weight:600; }
+    .badge { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; font-weight:600; }
+    .badge.pending { background:#78350f; color:#fde68a; }
+    .badge.fulfilled { background:#064e3b; color:#a7f3d0; }
+    .empty { color:#9ca3af; font-style:italic; }
+    small { color:#9ca3af; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>📚 Request a Book or Audiobook</h1>
+      <p><small>Can't find something in the library? Ask for it here.</small></p>
+      <form method="post" action="/request">
+        <label>Title *
+          <input name="title" required placeholder="e.g. Project Hail Mary">
+        </label>
+        <div class="row">
+          <div>
+            <label>Author
+              <input name="author" placeholder="e.g. Andy Weir">
+            </label>
+          </div>
+          <div>
+            <label>Type
+              <select name="media_type">
+                <option value="Audiobook">Audiobook</option>
+                <option value="Ebook">Ebook</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <label>Your name <small>(optional)</small>
+          <input name="requested_by" placeholder="so we know who to tell">
+        </label>
+        <label>Notes <small>(optional)</small>
+          <textarea name="notes" rows="2" placeholder="edition, narrator, series, etc."></textarea>
+        </label>
+        <button type="submit">Request It</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2 style="margin-top:0;">Requests</h2>
+      {% if rows %}
+      <table>
+        <tr>
+          <th>Status</th><th>Title</th><th>Author</th><th>Type</th><th>Requested by</th><th>Notes</th><th>When</th><th></th>
+        </tr>
+        {% for r in rows %}
+        <tr>
+          <td><span class="badge {{ 'fulfilled' if r.status == 'Fulfilled' else 'pending' }}">{{ r.status }}</span></td>
+          <td>{{ r.title }}</td>
+          <td>{{ r.author }}</td>
+          <td>{{ r.media_type }}</td>
+          <td>{{ r.requested_by }}</td>
+          <td>{{ r.notes }}</td>
+          <td>{{ r.timestamp }}</td>
+          <td>
+            <form method="post" action="/toggle/{{ r.id }}" style="margin:0;">
+              <button type="submit" class="secondary">{{ 'Mark pending' if r.status == 'Fulfilled' else 'Mark fulfilled' }}</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </table>
+      {% else %}
+      <p class="empty">No requests yet.</p>
+      {% endif %}
+    </div>
+  </div>
+</body>
+</html>
+'''
+
+
+def generate_requests_page_script(cfg):
+    media_root = cfg["storage"]["media_root"]
+    csv_path = str(Path(media_root) / "requests.csv")
+    port = cfg["requests_page"]["port"]
+
+    return f'''#!/usr/bin/env python3
+"""
+Lusty Library — book/audiobook request page.
+Generated by the Lusty Library setup wizard.
+"""
+import csv
+import threading
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+from flask import Flask, request, redirect, url_for, render_template_string
+
+app = Flask(__name__)
+
+CSV_PATH = Path({csv_path!r})
+FIELDNAMES = ["id", "timestamp", "title", "author", "media_type", "requested_by", "notes", "status"]
+LOCK = threading.Lock()
+
+PAGE = {REQUESTS_PAGE_TEMPLATE!r}
+
+
+def read_requests():
+    if not CSV_PATH.exists():
+        return []
+    with CSV_PATH.open("r", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def write_requests(rows):
+    tmp_path = CSV_PATH.with_suffix(".tmp")
+    with tmp_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+    tmp_path.replace(CSV_PATH)
+
+
+def append_request(row):
+    CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK:
+        rows = read_requests()
+        rows.append(row)
+        write_requests(rows)
+
+
+def set_status(request_id, status):
+    with LOCK:
+        rows = read_requests()
+        for r in rows:
+            if r.get("id") == request_id:
+                r["status"] = status
+        write_requests(rows)
+
+
+@app.route("/", methods=["GET"])
+def index():
+    rows = read_requests()
+    rows.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
+    return render_template_string(PAGE, rows=rows)
+
+
+@app.route("/request", methods=["POST"])
+def submit_request():
+    title = (request.form.get("title") or "").strip()
+    if title:
+        row = {{
+            "id": uuid.uuid4().hex[:8],
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "title": title,
+            "author": (request.form.get("author") or "").strip(),
+            "media_type": request.form.get("media_type") or "Audiobook",
+            "requested_by": (request.form.get("requested_by") or "").strip(),
+            "notes": (request.form.get("notes") or "").strip(),
+            "status": "Pending",
+        }}
+        append_request(row)
+    return redirect(url_for("index"))
+
+
+@app.route("/toggle/<request_id>", methods=["POST"])
+def toggle_status(request_id):
+    rows = read_requests()
+    current = next((r for r in rows if r.get("id") == request_id), None)
+    if current:
+        new_status = "Pending" if current.get("status") == "Fulfilled" else "Fulfilled"
+        set_status(request_id, new_status)
+    return redirect(url_for("index"))
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port={port})
+'''
+
+
+def install_requests_page(cfg, step_id):
+    if not cfg["requests_page"]["enabled"]:
+        log_line(step_id, "Book request page disabled, skipping.")
+        return
+
+    port = cfg["requests_page"]["port"]
+    media_root = cfg["storage"]["media_root"]
+
+    script = generate_requests_page_script(cfg)
+    write_file(REQUESTS_SCRIPT_PATH, script, step_id, mode=0o755)
+
+    service_content = f"""[Unit]
+Description=Lusty Library book/audiobook request page (port {port})
+After=network.target
+RequiresMountsFor={media_root}
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 {REQUESTS_SCRIPT_PATH}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+"""
+    write_file(REQUESTS_SERVICE_PATH, service_content, step_id)
+    run_cmd(["systemctl", "daemon-reload"], step_id, allow_fail=True)
+    run_cmd(["systemctl", "enable", "--now", "lustylibrary-requests.service"], step_id, allow_fail=True)
+
+    time.sleep(1.0)
+    rc = run_cmd(
+        ["curl", "-s", "-o", "/dev/null", "-w", "Request page responded with HTTP %{http_code}", f"http://127.0.0.1:{port}/"],
+        step_id,
+        allow_fail=True,
+    )
+    if rc != 0:
+        log_line(
+            step_id,
+            f"Couldn't confirm the request page is responding on port {port} yet — "
+            "check 'sudo systemctl status lustylibrary-requests.service'.",
+            level="error",
+        )
+    log_line(step_id, f"Requests are saved to {Path(media_root) / 'requests.csv'}.")
 
 
 # ---------------------------------------------------------------------------
@@ -1272,6 +1529,11 @@ def run_pipeline(cfg, storage_device, format_device):
             test_feature_led(cfg, "apps", cfg["leds"]["pin_abs"], "Audiobookshelf")
         set_step("apps", "done")
 
+        # requests page
+        set_step("requests_page", "running")
+        install_requests_page(cfg, "requests_page")
+        set_step("requests_page", "done")
+
         # sync
         set_step("sync", "running")
         apply_sync_config(cfg, "sync")
@@ -1442,6 +1704,20 @@ FORM_TEMPLATE = """
             <label for="cweb">Install Calibre-Web</label>
           </div>
           <small>Docker will be installed automatically first if it isn't already present.</small>
+        </fieldset>
+
+        <fieldset>
+          <legend>Book/Audiobook Requests</legend>
+          <div class="checkbox-row">
+            <input type="checkbox" id="requests_enabled" name="requests_enabled" {% if cfg.requests_page.enabled %}checked{% endif %}>
+            <label for="requests_enabled">Enable a request page for patrons</label>
+          </div>
+          <label>Port
+            <input name="requests_port" value="{{ cfg.requests_page.port }}">
+          </label>
+          <small>A simple page anyone on the hotspot can use to ask for a title. Requests are saved to
+          <code>requests.csv</code> in the media folder and shown in a table on the same page, with a
+          one-click "mark fulfilled" toggle.</small>
         </fieldset>
 
         <fieldset>
@@ -1639,6 +1915,7 @@ document.getElementById("setup-form").addEventListener("submit", async (e) => {
   payload.format_device = fd.has("format_device");
   payload.install_audiobookshelf = fd.has("install_audiobookshelf");
   payload.install_calibre_web = fd.has("install_calibre_web");
+  payload.requests_enabled = fd.has("requests_enabled");
   payload.enable_sync = fd.has("enable_sync");
   payload.server_username = fd.get("server_username") || "";
   payload.server_password = fd.get("server_password") || "";
@@ -1717,6 +1994,12 @@ def setup_apply():
 
     cfg["apps"]["install_audiobookshelf"] = bool(data.get("install_audiobookshelf"))
     cfg["apps"]["install_calibre_web"] = bool(data.get("install_calibre_web"))
+
+    cfg["requests_page"]["enabled"] = bool(data.get("requests_enabled"))
+    try:
+        cfg["requests_page"]["port"] = int(data.get("requests_port", cfg["requests_page"]["port"]))
+    except (TypeError, ValueError):
+        pass
 
     cfg["sync"]["enable_sync"] = bool(data.get("enable_sync"))
     cfg["sync"]["server_ip"] = (data.get("server_ip") or "").strip() or cfg["sync"]["server_ip"]
