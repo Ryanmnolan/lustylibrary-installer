@@ -12,6 +12,8 @@ Works on Raspberry Pi 3, 4 and 5, on both the classic dhcpcd/hostapd
 network stack (older Raspberry Pi OS) and the newer NetworkManager
 stack (current Raspberry Pi OS "Bookworm" and later).
 """
+import base64
+import io
 import itertools
 import json
 import os
@@ -30,6 +32,43 @@ app = Flask(__name__)
 INSTALL_DIR = Path("/opt/lustylibrary-installer")
 CONFIG_PATH = INSTALL_DIR / "config.yml"
 BOARD_INFO_PATH = INSTALL_DIR / "board_info.json"
+LOGO_PATH = Path(__file__).resolve().parent / "lusty_library_logo.png"
+
+
+def load_logo_data_uri():
+    """Loads the Lusty Library logo as an inline base64 data URI so every
+    page (setup wizard, request page, welcome page) can embed it without
+    a separate static-file route. Returns "" if the logo is missing so
+    pages degrade gracefully (no broken image) instead of failing."""
+    try:
+        data = LOGO_PATH.read_bytes()
+    except OSError:
+        return ""
+    return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+
+
+LOGO_DATA_URI = load_logo_data_uri()
+
+
+def generate_qr_data_uri(data):
+    """Generates a QR code as an inline SVG data URI, entirely offline (no
+    external QR-code API). Returns "" if the optional `qrcode` package
+    isn't installed or generation fails, so callers can skip the image
+    instead of breaking the page."""
+    try:
+        import qrcode
+        import qrcode.image.svg
+    except ImportError:
+        return ""
+    try:
+        img = qrcode.make(data, image_factory=qrcode.image.svg.SvgPathImage, box_size=10)
+        buf = io.BytesIO()
+        img.save(buf)
+        svg_bytes = buf.getvalue()
+    except Exception:
+        return ""
+    return "data:image/svg+xml;base64," + base64.b64encode(svg_bytes).decode("ascii")
+
 
 DEFAULT_CONFIG = {
     "wifi": {
@@ -66,6 +105,10 @@ DEFAULT_CONFIG = {
     "requests_page": {
         "enabled": True,
         "port": 5000,
+    },
+    "welcome": {
+        "ebook_login_note": "Username: book / Password: book",
+        "audiobook_login_note": "Username: book / Password: book",
     },
 }
 
@@ -145,6 +188,7 @@ STEP_ORDER = [
     ("trigger", "Setting up Ethernet plug-in trigger"),
     ("leds_service", "Installing status LED service"),
     ("shutdown_button", "Setting up shutdown button"),
+    ("welcome_page", "Generating welcome page"),
 ]
 
 STATE_LOCK = threading.Lock()
@@ -585,12 +629,18 @@ REQUESTS_PAGE_TEMPLATE = '''
     .badge.fulfilled { background:#064e3b; color:#a7f3d0; }
     .empty { color:#9ca3af; font-style:italic; }
     small { color:#9ca3af; }
+    .brand { display:flex; align-items:center; gap:14px; margin-bottom:4px; }
+    .brand img { height:56px; width:auto; }
+    .brand h1 { margin:0; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="card">
-      <h1>📚 Request a Book or Audiobook</h1>
+      <div class="brand">
+        {% if logo_data_uri %}<img src="{{ logo_data_uri }}" alt="Lusty Library logo">{% endif %}
+        <h1>📚 Request a Book or Audiobook</h1>
+      </div>
       <p><small>Can't find something in the library? Ask for it here.</small></p>
       <form method="post" action="/request">
         <label>Title *
@@ -659,6 +709,7 @@ def generate_requests_page_script(cfg):
     media_root = cfg["storage"]["media_root"]
     csv_path = str(Path(media_root) / "requests.csv")
     port = cfg["requests_page"]["port"]
+    logo_data_uri = LOGO_DATA_URI
 
     return f'''#!/usr/bin/env python3
 """
@@ -680,6 +731,7 @@ FIELDNAMES = ["id", "timestamp", "title", "author", "media_type", "requested_by"
 LOCK = threading.Lock()
 
 PAGE = {REQUESTS_PAGE_TEMPLATE!r}
+LOGO_DATA_URI = {logo_data_uri!r}
 
 
 def read_requests():
@@ -719,7 +771,7 @@ def set_status(request_id, status):
 def index():
     rows = read_requests()
     rows.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
-    return render_template_string(PAGE, rows=rows)
+    return render_template_string(PAGE, rows=rows, logo_data_uri=LOGO_DATA_URI)
 
 
 @app.route("/request", methods=["POST"])
@@ -1469,6 +1521,195 @@ WantedBy=multi-user.target
 
 
 # ---------------------------------------------------------------------------
+# welcome / instructions page (generated after install)
+# ---------------------------------------------------------------------------
+
+WELCOME_SCRIPT_PATH_NAME = "welcome.html"
+
+# Generic, always-correct app-store search links (rather than a specific app
+# ID we can't fully verify), so the QR code always lands somewhere useful.
+ABS_IOS_SEARCH_URL = "https://apps.apple.com/us/search?term=audiobookshelf"
+ABS_ANDROID_SEARCH_URL = "https://play.google.com/store/search?q=audiobookshelf&c=apps"
+
+# Matches the LED legend used on the printed instruction card.
+LED_COLOR_WIFI = "Green"
+LED_COLOR_ABS = "Blue"
+LED_COLOR_CWEB = "Yellow"
+
+WELCOME_PAGE_TEMPLATE = '''
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Welcome to the Lusty Library</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body { font-family: system-ui, sans-serif; background:#faf6f0; color:#2b2118; margin:0; }
+    .wrap { max-width:760px; margin:0 auto; padding:32px 20px 48px; }
+    .brand { text-align:center; margin-bottom:8px; }
+    .brand img { height:120px; width:auto; }
+    h1 { text-align:center; margin:4px 0 2px; font-size:28px; color:#4a2e0a; }
+    .subtitle { text-align:center; color:#8a6d4a; margin:0 0 28px; }
+    .card { background:#ffffff; border:1px solid #e7dcc9; padding:20px 22px; border-radius:14px;
+            margin-bottom:18px; box-shadow:0 2px 10px rgba(74,46,10,.06); }
+    .card h2 { margin:0 0 10px; font-size:18px; color:#4a2e0a; }
+    .card p { margin:4px 0; line-height:1.5; }
+    .row { display:flex; gap:20px; flex-wrap:wrap; align-items:center; }
+    .qr { text-align:center; }
+    .qr img { width:140px; height:140px; background:#fff; padding:6px; border-radius:8px; border:1px solid #e7dcc9; }
+    .qr small { display:block; margin-top:6px; color:#8a6d4a; }
+    .kv { background:#faf6f0; border-radius:8px; padding:10px 14px; font-family:ui-monospace,Menlo,Consolas,monospace;
+          font-size:14px; display:inline-block; }
+    .note { color:#8a6d4a; font-size:13px; }
+    .led-list { list-style:none; padding:0; margin:0; }
+    .led-list li { display:flex; align-items:center; gap:10px; padding:4px 0; }
+    .dot { width:14px; height:14px; border-radius:50%; flex-shrink:0; display:inline-block; }
+    .dot.green { background:#22c55e; }
+    .dot.blue { background:#3b82f6; }
+    .dot.yellow { background:#eab308; }
+    @media print {
+      body { background:#fff; }
+      .card { box-shadow:none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="brand">
+      {% if logo_data_uri %}<img src="{{ logo_data_uri }}" alt="Lusty Library logo">{% endif %}
+    </div>
+    <h1>Welcome to the Lusty Library</h1>
+    <p class="subtitle">Everything you need to connect, read, and listen.</p>
+
+    <div class="card">
+      <h2>📶 Connect to Wi-Fi</h2>
+      <p>Network name (SSID): <span class="kv">{{ wifi_ssid }}</span></p>
+      <p>Password: <span class="kv">{{ wifi_password }}</span></p>
+    </div>
+
+    {% if show_ebooks %}
+    <div class="card">
+      <h2>📖 eBooks</h2>
+      <div class="row">
+        {% if ebook_qr %}
+        <div class="qr"><img src="{{ ebook_qr }}" alt="eBooks QR code"><small>Scan to open</small></div>
+        {% endif %}
+        <div>
+          <p>Or open <span class="kv">{{ ebook_url }}</span> in a browser.</p>
+          {% if ebook_login_note %}<p class="note">{{ ebook_login_note }}</p>{% endif %}
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    {% if show_audiobooks %}
+    <div class="card">
+      <h2>🎧 Audiobooks</h2>
+      <p>Install the free <strong>Audiobookshelf</strong> app, then add this server address:</p>
+      <p><span class="kv">{{ audiobook_url }}</span></p>
+      {% if audiobook_login_note %}<p class="note">{{ audiobook_login_note }}</p>{% endif %}
+      <div class="row" style="margin-top:10px;">
+        {% if abs_ios_qr %}
+        <div class="qr"><img src="{{ abs_ios_qr }}" alt="iOS app QR code"><small>iOS</small></div>
+        {% endif %}
+        {% if abs_android_qr %}
+        <div class="qr"><img src="{{ abs_android_qr }}" alt="Android app QR code"><small>Android</small></div>
+        {% endif %}
+      </div>
+    </div>
+    {% endif %}
+
+    {% if show_requests %}
+    <div class="card">
+      <h2>🙋 Request New Books or Audiobooks</h2>
+      <div class="row">
+        {% if requests_qr %}
+        <div class="qr"><img src="{{ requests_qr }}" alt="Request page QR code"><small>Scan to request</small></div>
+        {% endif %}
+        <p>Or visit <span class="kv">{{ requests_url }}</span></p>
+      </div>
+    </div>
+    {% endif %}
+
+    {% if show_shutdown %}
+    <div class="card">
+      <h2>⏻ Shutting Down</h2>
+      <p>Press and hold the shutdown button for about {{ shutdown_hold_secs }} seconds. The status
+      LEDs will flash a few times, then it's safe to unplug the power.</p>
+    </div>
+    {% endif %}
+
+    {% if show_leds %}
+    <div class="card">
+      <h2>💡 LED Indicators</h2>
+      <ul class="led-list">
+        <li><span class="dot green"></span> Green — Wi-Fi ready</li>
+        {% if show_ebooks %}<li><span class="dot yellow"></span> Yellow — eBooks ready</li>{% endif %}
+        {% if show_audiobooks %}<li><span class="dot blue"></span> Blue — Audiobooks ready</li>{% endif %}
+      </ul>
+    </div>
+    {% endif %}
+  </div>
+</body>
+</html>
+'''
+
+
+def render_welcome_page(cfg):
+    wifi_ip = cfg["wifi"]["ip"]
+    show_ebooks = bool(cfg["apps"]["install_calibre_web"])
+    show_audiobooks = bool(cfg["apps"]["install_audiobookshelf"])
+    show_requests = bool(cfg["requests_page"]["enabled"])
+    show_shutdown = bool(cfg["shutdown_button"]["enabled"])
+    show_leds = bool(cfg["leds"]["enabled"])
+
+    ebook_url = f"http://{wifi_ip}:8083"
+    audiobook_url = f"http://{wifi_ip}:13378"
+    requests_url = f"http://{wifi_ip}:{cfg['requests_page']['port']}"
+
+    # render_template_string needs an app context; the /welcome route
+    # already has one, but this is also called from the pipeline's
+    # background thread (no request in flight), so make sure one exists
+    # either way rather than crashing setup at the last step.
+    with app.app_context():
+        return render_template_string(
+            WELCOME_PAGE_TEMPLATE,
+            logo_data_uri=LOGO_DATA_URI,
+            wifi_ssid=cfg["wifi"]["ssid"],
+            wifi_password=cfg["wifi"]["password"],
+            show_ebooks=show_ebooks,
+            show_audiobooks=show_audiobooks,
+            show_requests=show_requests,
+            show_shutdown=show_shutdown,
+            show_leds=show_leds,
+            ebook_url=ebook_url,
+            audiobook_url=audiobook_url,
+            requests_url=requests_url,
+            ebook_login_note=cfg["welcome"]["ebook_login_note"],
+            audiobook_login_note=cfg["welcome"]["audiobook_login_note"],
+            shutdown_hold_secs=cfg["shutdown_button"]["hold_secs"],
+            ebook_qr=generate_qr_data_uri(ebook_url) if show_ebooks else "",
+            abs_ios_qr=generate_qr_data_uri(ABS_IOS_SEARCH_URL) if show_audiobooks else "",
+            abs_android_qr=generate_qr_data_uri(ABS_ANDROID_SEARCH_URL) if show_audiobooks else "",
+            requests_qr=generate_qr_data_uri(requests_url) if show_requests else "",
+        )
+
+
+def write_welcome_page(cfg, step_id):
+    """Renders the welcome/instructions page and saves a static copy in the
+    media folder (so it can be opened/printed even without the setup
+    wizard running), in addition to the live /welcome route."""
+    html = render_welcome_page(cfg)
+    media_root = cfg["storage"]["media_root"]
+    out_path = Path(media_root) / WELCOME_SCRIPT_PATH_NAME
+    write_file(out_path, html, step_id)
+    log_line(
+        step_id,
+        f"Welcome page ready — http://{cfg['wifi']['ip']}:9000/welcome (also saved to {out_path})",
+    )
+
+
+# ---------------------------------------------------------------------------
 # pipeline
 # ---------------------------------------------------------------------------
 
@@ -1556,6 +1797,12 @@ def run_pipeline(cfg, storage_device, format_device):
         setup_shutdown_button(cfg, "shutdown_button")
         set_step("shutdown_button", "done")
 
+        # welcome page: generated last, once every feature's real on/off
+        # state (apps, requests page, LEDs, shutdown button) is known
+        set_step("welcome_page", "running")
+        write_welcome_page(cfg, "welcome_page")
+        set_step("welcome_page", "done")
+
     except StepFailed as e:
         ok = False
         # mark the in-flight step (and anything after it) as failed/skipped
@@ -1638,12 +1885,19 @@ FORM_TEMPLATE = """
     #banner { display:none; padding:12px 16px; border-radius:8px; margin-bottom:16px; font-weight:600; }
     #banner.ok { display:block; background:#064e3b; color:#a7f3d0; }
     #banner.fail { display:block; background:#450a0a; color:#fecaca; }
+    #banner a { color:inherit; text-decoration:underline; }
+    .brand { display:flex; align-items:center; gap:14px; }
+    .brand img { height:56px; width:auto; }
+    .brand h1 { margin:0; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="card">
-      <h1>📚 Lusty Library Setup</h1>
+      <div class="brand">
+        {% if logo_data_uri %}<img src="{{ logo_data_uri }}" alt="Lusty Library logo">{% endif %}
+        <h1>📚 Lusty Library Setup</h1>
+      </div>
       <div class="board-info">
         Board: {{ board.model }} &middot; OS: {{ board.os_codename }} &middot; Arch: {{ board.arch }}
       </div>
@@ -1718,6 +1972,20 @@ FORM_TEMPLATE = """
           <small>A simple page anyone on the hotspot can use to ask for a title. Requests are saved to
           <code>requests.csv</code> in the media folder and shown in a table on the same page, with a
           one-click "mark fulfilled" toggle.</small>
+        </fieldset>
+
+        <fieldset>
+          <legend>Welcome / Instructions Page</legend>
+          <label>eBooks login note (shown to patrons)
+            <input name="ebook_login_note" value="{{ cfg.welcome.ebook_login_note }}">
+          </label>
+          <label>Audiobooks login note (shown to patrons)
+            <input name="audiobook_login_note" value="{{ cfg.welcome.audiobook_login_note }}">
+          </label>
+          <small>After setup finishes, a printable welcome page is generated at
+          <code>/welcome</code> with the Lusty Library logo, Wi-Fi info, QR codes for eBooks,
+          Audiobooks, and requests, and (if enabled) the shutdown button and LED legend — only for
+          the features you actually installed.</small>
         </fieldset>
 
         <fieldset>
@@ -1854,7 +2122,11 @@ function appendLine(text, cls) {
 function showBanner(ok) {
   const b = document.getElementById("banner");
   b.className = ok ? "ok" : "fail";
-  b.textContent = ok ? "Setup finished successfully." : "Setup stopped due to an error — see the console below.";
+  if (ok) {
+    b.innerHTML = 'Setup finished successfully. <a href="/welcome" target="_blank">View the welcome page &rarr;</a>';
+  } else {
+    b.textContent = "Setup stopped due to an error — see the console below.";
+  }
 }
 
 function showConfirm(data) {
@@ -1972,6 +2244,7 @@ def setup():
         board=board,
         step_order=STEP_ORDER,
         step_order_json=json.dumps({sid: label for sid, label in STEP_ORDER}),
+        logo_data_uri=LOGO_DATA_URI,
     )
 
 
@@ -2025,11 +2298,20 @@ def setup_apply():
     except (TypeError, ValueError):
         pass
 
+    cfg["welcome"]["ebook_login_note"] = (data.get("ebook_login_note") or "").strip()
+    cfg["welcome"]["audiobook_login_note"] = (data.get("audiobook_login_note") or "").strip()
+
     save_config(cfg)
 
     thread = threading.Thread(target=run_pipeline, args=(cfg, storage_device, format_device), daemon=True)
     thread.start()
     return jsonify({"started": True})
+
+
+@app.route("/welcome")
+def welcome():
+    cfg = load_config()
+    return render_welcome_page(cfg)
 
 
 @app.route("/setup/state", methods=["GET"])

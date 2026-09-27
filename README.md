@@ -14,6 +14,9 @@ It sets up:
   [Calibre-Web](https://github.com/janeczku/calibre-web) via Docker
 - A patron-facing book/audiobook request page on port 5000, saving to a
   CSV in the media folder
+- A printable "Welcome to the Lusty Library" page, generated automatically
+  once setup finishes, with the Lusty Library logo, Wi-Fi info, and QR
+  codes for eBooks, Audiobooks and requests
 - Optional one-way sync of audiobooks/books from another server on your
   network, triggered automatically the instant an Ethernet cable is
   plugged in (event-driven — no polling), with optional SMB
@@ -67,6 +70,43 @@ page, newest first, with a one-click "mark fulfilled" toggle. Writes are
 locked and done via a write-then-rename so concurrent submissions can't
 corrupt the file. Toggle it off in the wizard, or change its port, under
 "Book/Audiobook Requests."
+
+## Logo
+
+The Lusty Library logo (`lusty_library_logo.png`, background removed) is
+embedded directly into every page the wizard serves — the setup wizard
+itself (port 9000), the book request page (port 5000), and the welcome
+page below — so nothing extra needs to be hosted or linked separately.
+
+## Welcome page
+
+Once setup finishes, a printable instructions page is generated at:
+
+```
+http://<pi-ip>:9000/welcome
+```
+
+A static copy is also saved to `welcome.html` in the media folder (e.g.
+`/mnt/media/welcome.html`) so it can be opened or printed without the
+wizard running. It's built from whatever you actually enabled — only
+showing eBooks, Audiobooks, requests, the shutdown button, or the LED
+legend for the pieces that are actually installed — and includes:
+
+- The Lusty Library logo and Wi-Fi network name/password
+- A QR code (and the URL) for eBooks (Calibre-Web), if installed
+- The Audiobookshelf server address plus QR codes to install the app on
+  iOS/Android, if installed
+- A QR code for the book/audiobook request page, if enabled
+- Shutdown button instructions, if wired up
+- The LED color legend (Green = Wi-Fi ready, Yellow = eBooks ready,
+  Blue = Audiobooks ready), if status LEDs are wired up
+
+The login notes shown under eBooks/Audiobooks are editable in the wizard
+under "Welcome / Instructions Page" (they're just a display hint — this
+installer doesn't provision per-patron accounts). QR codes are generated
+offline with the `qrcode` package (as inline SVGs); if that package isn't
+installed, the page still works, it just omits the QR images and shows the
+plain URLs instead.
 
 ## Auto-sync trigger
 
