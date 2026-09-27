@@ -11,12 +11,14 @@ It sets up:
   without any other network
 - Optional storage formatting/mounting for an attached USB drive
 - [Audiobookshelf](https://www.audiobookshelf.org/) and/or
-  [Calibre-Web](https://github.com/janeczku/calibre-web) via Docker
+  [Calibre-Web](https://github.com/janeczku/calibre-web) via Docker, with a
+  patron account automatically created in whichever you install
 - A patron-facing book/audiobook request page on port 5000, saving to a
   CSV in the media folder
-- A printable "Welcome to the Lusty Library" page, generated automatically
-  once setup finishes, with the Lusty Library logo, Wi-Fi info, and QR
-  codes for eBooks, Audiobooks and requests
+- A printable "Welcome to the Lusty Library" page (HTML and PDF), generated
+  automatically once setup finishes, with the Lusty Library logo, Wi-Fi
+  info, the patron account, and QR codes for eBooks, Audiobooks and
+  requests
 - Optional one-way sync of audiobooks/books from another server on your
   network, triggered automatically the instant an Ethernet cable is
   plugged in (event-driven — no polling), with optional SMB
@@ -78,35 +80,65 @@ embedded directly into every page the wizard serves — the setup wizard
 itself (port 9000), the book request page (port 5000), and the welcome
 page below — so nothing extra needs to be hosted or linked separately.
 
+## Patron account
+
+Under "Apps to install," set a single patron username/password (default
+`book`/`book`). During setup, the **"accounts"** step logs into whichever
+apps you installed and creates that account for real:
+
+- **Calibre-Web**: logs in with the app's documented first-run admin
+  account (`admin`/`admin123`) and submits its own "add user" form to
+  create the patron account — the same form the web UI itself uses, not a
+  private API.
+- **Audiobookshelf**: uses the server's one-time setup flow (`/status` +
+  `/init`) to set the patron username/password as the root account. If the
+  server was already initialized (e.g. re-running setup), it just confirms
+  those credentials still log in instead of overwriting anything.
+
+Both are best-effort and non-fatal — if a login page or form has changed
+in a newer app version, the step logs exactly what failed (status codes,
+etc.) and setup keeps going rather than aborting. Whatever actually
+happened (`created`, `already exists`, or `failed: ...`) is what shows up
+on the welcome page — never a hand-typed note that might not match reality.
+
 ## Welcome page
 
 Once setup finishes, a printable instructions page is generated at:
 
 ```
-http://<pi-ip>:9000/welcome
+http://<pi-ip>:9000/welcome        (HTML)
+http://<pi-ip>:9000/welcome.pdf    (PDF, for printing)
 ```
 
-A static copy is also saved to `welcome.html` in the media folder (e.g.
-`/mnt/media/welcome.html`) so it can be opened or printed without the
-wizard running. It's built from whatever you actually enabled — only
-showing eBooks, Audiobooks, requests, the shutdown button, or the LED
-legend for the pieces that are actually installed — and includes:
+Static copies are also saved to `welcome.html` and `welcome.pdf` in the
+media folder (e.g. `/mnt/media/welcome.pdf`) so they can be opened or
+printed without the wizard running. It's built entirely from what the
+wizard actually configured/did — only showing eBooks, Audiobooks,
+requests, the shutdown button, or the LED legend for the pieces that are
+actually installed — and includes:
 
 - The Lusty Library logo and Wi-Fi network name/password
-- A QR code (and the URL) for eBooks (Calibre-Web), if installed
+- A QR code (and the URL) for eBooks (Calibre-Web), if installed, plus the
+  patron login it actually ended up with
 - The Audiobookshelf server address plus QR codes to install the app on
-  iOS/Android, if installed
+  iOS/Android, if installed, plus the patron login
 - A QR code for the book/audiobook request page, if enabled
 - Shutdown button instructions, if wired up
 - The LED color legend (Green = Wi-Fi ready, Yellow = eBooks ready,
   Blue = Audiobooks ready), if status LEDs are wired up
 
-The login notes shown under eBooks/Audiobooks are editable in the wizard
-under "Welcome / Instructions Page" (they're just a display hint — this
-installer doesn't provision per-patron accounts). QR codes are generated
-offline with the `qrcode` package (as inline SVGs); if that package isn't
-installed, the page still works, it just omits the QR images and shows the
-plain URLs instead.
+### QR codes, installed and removed automatically
+
+QR codes are generated offline (no external QR API). The **"qr_codes"**
+step installs the `qrcode` Python package just long enough to generate
+every QR image this install needs, verifies each one actually opened as a
+valid image, caches the results to `qr_cache.json` next to the installer,
+and then **uninstalls `qrcode` again** — it's only ever needed once, so it
+isn't kept as a permanent dependency. The welcome page and PDF read from
+that cache afterward, so they keep working correctly even after the
+package is gone and across service restarts. If installing `qrcode` fails
+(e.g. no network at that moment), the page just falls back to showing
+plain URLs instead of QR images.
 
 ## Auto-sync trigger
 
@@ -185,5 +217,12 @@ passwordless `sudo` configured for any user.
 - The request page (port 5000) also has no login and its "mark
   fulfilled" toggle has no confirmation — fine on a private hotspot,
   not for an open network.
-- `config.yml` (the wizard's own saved settings) stores the Wi-Fi and SMB
-  passwords in plain text.
+- `config.yml` (the wizard's own saved settings) stores the Wi-Fi, SMB,
+  and patron account passwords in plain text.
+- Automatic patron-account creation depends on each app's current
+  login/setup forms; if a future Calibre-Web or Audiobookshelf release
+  changes them, that one step logs a clear failure and setup continues —
+  you'd just create the account by hand in that app's own UI instead.
+- The welcome PDF uses a simpler layout than the on-screen welcome page
+  (the PDF library doesn't support the same CSS), so print styling may
+  differ slightly, but the content is identical.

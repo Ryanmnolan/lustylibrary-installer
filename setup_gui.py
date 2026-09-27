@@ -24,7 +24,8 @@ import threading
 import time
 from pathlib import Path
 
-from flask import Flask, Response, request, render_template_string, redirect, url_for, jsonify
+from flask import Flask, Response, request, render_template_string, redirect, url_for, jsonify, send_file
+import requests
 import yaml
 
 app = Flask(__name__)
@@ -51,23 +52,60 @@ LOGO_DATA_URI = load_logo_data_uri()
 
 
 def generate_qr_data_uri(data):
-    """Generates a QR code as an inline SVG data URI, entirely offline (no
+    """Generates a QR code as an inline PNG data URI, entirely offline (no
     external QR-code API). Returns "" if the optional `qrcode` package
     isn't installed or generation fails, so callers can skip the image
-    instead of breaking the page."""
+    instead of breaking the page. PNG (not SVG) so the same image embeds
+    cleanly in both the live HTML page and the generated PDF."""
     try:
         import qrcode
-        import qrcode.image.svg
     except ImportError:
         return ""
     try:
-        img = qrcode.make(data, image_factory=qrcode.image.svg.SvgPathImage, box_size=10)
+        img = qrcode.make(data, box_size=8, border=2)
         buf = io.BytesIO()
-        img.save(buf)
-        svg_bytes = buf.getvalue()
+        img.save(buf, format="PNG")
+        png_bytes = buf.getvalue()
     except Exception:
         return ""
-    return "data:image/svg+xml;base64," + base64.b64encode(svg_bytes).decode("ascii")
+    return "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+
+
+# ---------------------------------------------------------------------------
+# QR code cache
+#
+# The `qrcode` package is only ever needed once per install, to bake a
+# handful of QR images into the welcome page/PDF. Rather than keep it
+# installed forever, the "qr_codes" pipeline step installs it, generates
+# and verifies every QR code this install needs, saves them to this cache
+# file, then uninstalls the package again. render_welcome_page() (and the
+# /welcome, /welcome.pdf routes) read from the cache so the welcome page
+# keeps working correctly even after `qrcode` is gone and even across a
+# service restart.
+# ---------------------------------------------------------------------------
+
+QR_CACHE_PATH = INSTALL_DIR / "qr_cache.json"
+
+
+def load_qr_cache():
+    if QR_CACHE_PATH.exists():
+        try:
+            return json.loads(QR_CACHE_PATH.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_qr_cache(cache):
+    QR_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    QR_CACHE_PATH.write_text(json.dumps(cache))
+
+
+def get_cached_qr(cache, key, data):
+    """Returns the cached QR data URI for `key` if present, otherwise
+    falls back to generating one on the fly (works if `qrcode` happens to
+    still be installed; returns "" otherwise so the page just omits it)."""
+    return cache.get(key) or generate_qr_data_uri(data)
 
 
 DEFAULT_CONFIG = {
@@ -82,6 +120,11 @@ DEFAULT_CONFIG = {
     "apps": {
         "install_audiobookshelf": True,
         "install_calibre_web": True,
+        "patron_username": "book",
+        "patron_password": "book",
+        # filled in by the "accounts" step at run time — not user-editable
+        "calibre_account_status": "not attempted",
+        "audiobookshelf_account_status": "not attempted",
     },
     "sync": {
         "enable_sync": False,
@@ -105,10 +148,6 @@ DEFAULT_CONFIG = {
     "requests_page": {
         "enabled": True,
         "port": 5000,
-    },
-    "welcome": {
-        "ebook_login_note": "Username: book / Password: book",
-        "audiobook_login_note": "Username: book / Password: book",
     },
 }
 
@@ -183,12 +222,14 @@ STEP_ORDER = [
     ("storage", "Setting up storage"),
     ("docker", "Checking Docker"),
     ("apps", "Installing apps"),
+    ("accounts", "Creating patron accounts"),
     ("requests_page", "Setting up the book request page"),
     ("sync", "Configuring auto-sync"),
     ("trigger", "Setting up Ethernet plug-in trigger"),
     ("leds_service", "Installing status LED service"),
     ("shutdown_button", "Setting up shutdown button"),
-    ("welcome_page", "Generating welcome page"),
+    ("qr_codes", "Generating QR codes"),
+    ("welcome_page", "Generating welcome page & PDF"),
 ]
 
 STATE_LOCK = threading.Lock()
@@ -590,6 +631,156 @@ def bring_up_apps(compose_path, step_id):
     if rc != 0:
         log_line(step_id, "'docker compose' plugin unavailable, trying legacy 'docker-compose'...")
         run_cmd(["docker-compose", "-f", str(compose_path), "up", "-d"], step_id)
+
+
+# ---------------------------------------------------------------------------
+# patron account auto-provisioning (Calibre-Web / Audiobookshelf)
+#
+# Best-effort: these talk to each app's own web server over HTTP to create
+# the patron account shown on the welcome page, using the real login/setup
+# forms each app already serves (not a guessed private API), so a login or
+# form field that changes in a future app version fails loudly in the log
+# rather than silently. Never raises StepFailed — a login page you can't
+# script around isn't a reason to abort the whole install.
+# ---------------------------------------------------------------------------
+
+CALIBRE_DEFAULT_ADMIN_USER = "admin"
+CALIBRE_DEFAULT_ADMIN_PASSWORD = "admin123"  # linuxserver/calibre-web's documented first-run default
+
+
+def _wait_for_http(url, step_id, timeout=90):
+    """Polls a URL until it responds (any status code counts — we just
+    need the app's web server to be up), or gives up after `timeout`s."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            requests.get(url, timeout=5)
+            return True
+        except requests.RequestException:
+            time.sleep(2)
+    log_line(step_id, f"Timed out waiting for {url} to respond.", level="error")
+    return False
+
+
+def _extract_csrf_token(html):
+    """Pulls a Flask-WTF style hidden csrf_token field out of an HTML
+    form, if present. Returns None if there isn't one (some setups run
+    without CSRF protection)."""
+    import re
+
+    m = re.search(r'name="csrf_token"[^>]*value="([^"]+)"', html)
+    return m.group(1) if m else None
+
+
+def provision_calibre_web_account(cfg, step_id):
+    """Logs into Calibre-Web with its documented first-run admin account
+    and creates (or updates) the patron account shown on the welcome page,
+    via the same /admin/user/new form the web UI itself uses."""
+    base = "http://127.0.0.1:8083"
+    username = cfg["apps"]["patron_username"]
+    password = cfg["apps"]["patron_password"]
+
+    if not _wait_for_http(base, step_id):
+        cfg["apps"]["calibre_account_status"] = "failed: Calibre-Web never came up"
+        return
+
+    session = requests.Session()
+    try:
+        login_page = session.get(f"{base}/login", timeout=10)
+        token = _extract_csrf_token(login_page.text)
+        login_data = {"username": CALIBRE_DEFAULT_ADMIN_USER, "password": CALIBRE_DEFAULT_ADMIN_PASSWORD}
+        if token:
+            login_data["csrf_token"] = token
+        resp = session.post(f"{base}/login", data=login_data, timeout=10)
+        if "login" in resp.url and resp.status_code == 200:
+            log_line(
+                step_id,
+                "Calibre-Web admin login didn't look successful (default admin/admin123 may already "
+                "have been changed) — skipping automatic patron account creation.",
+                level="error",
+            )
+            cfg["apps"]["calibre_account_status"] = "failed: could not log in as default admin"
+            return
+
+        new_user_page = session.get(f"{base}/admin/user/new", timeout=10)
+        token = _extract_csrf_token(new_user_page.text)
+        form = {
+            "name": username,
+            "email": f"{username}@lustylibrary.local",
+            "password": password,
+            "kobo_support": "",
+            "download_role": "on",
+            "viewer_role": "on",
+        }
+        if token:
+            form["csrf_token"] = token
+        resp = session.post(f"{base}/admin/user/new", data=form, timeout=10)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"HTTP {resp.status_code} creating user")
+
+        log_line(step_id, f"Calibre-Web patron account '{username}' created.")
+        cfg["apps"]["calibre_account_status"] = "created"
+    except Exception as e:  # noqa: BLE001 - best effort, never fail the install over this
+        log_line(step_id, f"Couldn't auto-create the Calibre-Web patron account: {e}", level="error")
+        cfg["apps"]["calibre_account_status"] = f"failed: {e}"
+
+
+def provision_audiobookshelf_account(cfg, step_id):
+    """Sets up Audiobookshelf's one-time root account as the patron
+    account, via the same /status + /init flow its own first-run setup
+    screen uses. If the server was already initialized (e.g. re-running
+    setup), it just confirms those credentials still log in."""
+    base = "http://127.0.0.1:13378"
+    username = cfg["apps"]["patron_username"]
+    password = cfg["apps"]["patron_password"]
+
+    if not _wait_for_http(base, step_id):
+        cfg["apps"]["audiobookshelf_account_status"] = "failed: Audiobookshelf never came up"
+        return
+
+    try:
+        status = requests.get(f"{base}/status", timeout=10).json()
+        if not status.get("isInit", True):
+            resp = requests.post(
+                f"{base}/init",
+                json={"newRoot": {"username": username, "password": password}},
+                timeout=10,
+            )
+            if resp.status_code >= 400:
+                raise RuntimeError(f"HTTP {resp.status_code} initializing server")
+            log_line(step_id, f"Audiobookshelf root/patron account '{username}' created.")
+            cfg["apps"]["audiobookshelf_account_status"] = "created"
+        else:
+            # Already initialized (e.g. re-run) — just confirm we can log in.
+            resp = requests.post(f"{base}/login", json={"username": username, "password": password}, timeout=10)
+            if resp.status_code == 200:
+                log_line(step_id, f"Audiobookshelf already set up; '{username}' logs in fine.")
+                cfg["apps"]["audiobookshelf_account_status"] = "already exists"
+            else:
+                log_line(
+                    step_id,
+                    "Audiobookshelf is already initialized with different credentials — "
+                    "log in as the existing root user to manage accounts.",
+                    level="error",
+                )
+                cfg["apps"]["audiobookshelf_account_status"] = "failed: already initialized with other credentials"
+    except Exception as e:  # noqa: BLE001 - best effort, never fail the install over this
+        log_line(step_id, f"Couldn't auto-create the Audiobookshelf account: {e}", level="error")
+        cfg["apps"]["audiobookshelf_account_status"] = f"failed: {e}"
+
+
+def provision_accounts(cfg, step_id):
+    if cfg["apps"]["install_calibre_web"]:
+        provision_calibre_web_account(cfg, step_id)
+    else:
+        cfg["apps"]["calibre_account_status"] = "not installed"
+
+    if cfg["apps"]["install_audiobookshelf"]:
+        provision_audiobookshelf_account(cfg, step_id)
+    else:
+        cfg["apps"]["audiobookshelf_account_status"] = "not installed"
+
+    save_config(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -1524,7 +1715,8 @@ WantedBy=multi-user.target
 # welcome / instructions page (generated after install)
 # ---------------------------------------------------------------------------
 
-WELCOME_SCRIPT_PATH_NAME = "welcome.html"
+WELCOME_HTML_NAME = "welcome.html"
+WELCOME_PDF_NAME = "welcome.pdf"
 
 # Generic, always-correct app-store search links (rather than a specific app
 # ID we can't fully verify), so the QR code always lands somewhere useful.
@@ -1535,6 +1727,86 @@ ABS_ANDROID_SEARCH_URL = "https://play.google.com/store/search?q=audiobookshelf&
 LED_COLOR_WIFI = "Green"
 LED_COLOR_ABS = "Blue"
 LED_COLOR_CWEB = "Yellow"
+
+def qr_targets(cfg):
+    """Every (cache key, data) pair this install needs a QR code for,
+    based on what's actually enabled — kept in one place so generation
+    and rendering always agree on what "the QR codes" means."""
+    wifi_ip = cfg["wifi"]["ip"]
+    targets = {}
+    if cfg["apps"]["install_calibre_web"]:
+        targets["ebook"] = f"http://{wifi_ip}:8083"
+    if cfg["apps"]["install_audiobookshelf"]:
+        targets["abs_ios"] = ABS_IOS_SEARCH_URL
+        targets["abs_android"] = ABS_ANDROID_SEARCH_URL
+    if cfg["requests_page"]["enabled"]:
+        targets["requests"] = f"http://{wifi_ip}:{cfg['requests_page']['port']}"
+    return targets
+
+
+def generate_and_cache_qr_codes(cfg, step_id):
+    """Installs `qrcode` just long enough to generate and verify every QR
+    code this install needs, caches the resulting images to disk, then
+    uninstalls the package again — so QR support doesn't need to be a
+    permanent dependency of the installer."""
+    targets = qr_targets(cfg)
+    if not targets:
+        log_line(step_id, "No QR codes needed for this configuration, skipping.")
+        return
+
+    rc = run_cmd(["pip3", "install", "--break-system-packages", "-q", "qrcode[pil]"], step_id, allow_fail=True)
+    if rc != 0:
+        # Some environments don't understand --break-system-packages; fall back.
+        rc = run_cmd(["pip3", "install", "-q", "qrcode[pil]"], step_id, allow_fail=True)
+    if rc != 0:
+        log_line(step_id, "Couldn't install the 'qrcode' package — welcome page will skip QR images.", level="error")
+        return
+
+    cache = {}
+    all_ok = True
+    for key, data in targets.items():
+        try:
+            import qrcode
+
+            img = qrcode.make(data, box_size=8, border=2)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            png_bytes = buf.getvalue()
+
+            # Verify: re-open the generated image and confirm it's a real,
+            # sane QR image (non-trivial size) before trusting it. If a
+            # decoder happens to be available, do a real decode-and-compare
+            # for extra confidence; otherwise this structural check stands
+            # in for it without requiring extra system packages.
+            from PIL import Image
+
+            check_img = Image.open(io.BytesIO(png_bytes))
+            if check_img.size[0] < 20 or check_img.size[1] < 20:
+                raise ValueError("generated QR image looks too small to be valid")
+            try:
+                from pyzbar.pyzbar import decode as zbar_decode
+
+                decoded = zbar_decode(check_img)
+                if not decoded or decoded[0].data.decode("utf-8", "ignore") != data:
+                    raise ValueError("decoded QR content didn't match")
+                log_line(step_id, f"QR code '{key}' generated and decode-verified.")
+            except ImportError:
+                log_line(step_id, f"QR code '{key}' generated and looks valid ({check_img.size[0]}x{check_img.size[1]}).")
+
+            cache[key] = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+        except Exception as e:  # noqa: BLE001 - one bad QR shouldn't lose the rest
+            log_line(step_id, f"QR code '{key}' failed verification, skipping it: {e}", level="error")
+            all_ok = False
+
+    save_qr_cache(cache)
+    log_line(step_id, f"Cached {len(cache)}/{len(targets)} QR code(s) to {QR_CACHE_PATH}.")
+
+    run_cmd(["pip3", "uninstall", "-y", "-q", "qrcode"], step_id, allow_fail=True)
+    log_line(step_id, "Removed the 'qrcode' package again — not needed after this point.")
+
+    if not all_ok:
+        log_line(step_id, "Some QR codes couldn't be verified; the welcome page will just show plain links for those.", level="error")
+
 
 WELCOME_PAGE_TEMPLATE = '''
 <!doctype html>
@@ -1654,8 +1926,111 @@ WELCOME_PAGE_TEMPLATE = '''
 </html>
 '''
 
+# A separate, table-based layout for the PDF: xhtml2pdf (used to render it)
+# doesn't support flexbox, so the on-screen template above isn't reused
+# directly — this one shares the same context/data, just laid out simply.
+WELCOME_PDF_TEMPLATE = '''
+<html>
+<head>
+<style>
+  body { font-family: Helvetica, Arial, sans-serif; color:#2b2118; font-size:11pt; }
+  .center { text-align:center; }
+  h1 { text-align:center; color:#4a2e0a; font-size:22pt; margin-bottom:2pt; }
+  .subtitle { text-align:center; color:#8a6d4a; margin-bottom:16pt; font-size:11pt; }
+  .card { border:1pt solid #e7dcc9; padding:10pt; margin-bottom:12pt; }
+  .card h2 { color:#4a2e0a; font-size:14pt; margin:0 0 6pt 0; }
+  .kv { background-color:#faf6f0; font-family:Courier, monospace; padding:4pt 8pt; }
+  .note { color:#8a6d4a; font-size:9pt; }
+  table.layout { width:100%; }
+  table.layout td { vertical-align:top; padding-right:10pt; }
+  img.qr { width:100pt; height:100pt; }
+</style>
+</head>
+<body>
+  <div class="center">
+    {% if logo_data_uri %}<img src="{{ logo_data_uri }}" width="140" height="140"/>{% endif %}
+  </div>
+  <h1>Welcome to the Lusty Library</h1>
+  <p class="subtitle">Everything you need to connect, read, and listen.</p>
 
-def render_welcome_page(cfg):
+  <div class="card">
+    <h2>Connect to Wi-Fi</h2>
+    <p>Network name (SSID): <span class="kv">{{ wifi_ssid }}</span></p>
+    <p>Password: <span class="kv">{{ wifi_password }}</span></p>
+  </div>
+
+  {% if show_ebooks %}
+  <div class="card">
+    <h2>eBooks</h2>
+    <table class="layout"><tr>
+      <td style="width:110pt;">{% if ebook_qr %}<img class="qr" src="{{ ebook_qr }}"/>{% endif %}</td>
+      <td>
+        <p>Open <span class="kv">{{ ebook_url }}</span> in a browser.</p>
+        {% if ebook_login_note %}<p class="note">{{ ebook_login_note }}</p>{% endif %}
+      </td>
+    </tr></table>
+  </div>
+  {% endif %}
+
+  {% if show_audiobooks %}
+  <div class="card">
+    <h2>Audiobooks</h2>
+    <p>Install the free Audiobookshelf app, then add this server address:</p>
+    <p><span class="kv">{{ audiobook_url }}</span></p>
+    {% if audiobook_login_note %}<p class="note">{{ audiobook_login_note }}</p>{% endif %}
+    <table class="layout"><tr>
+      <td style="width:110pt;">{% if abs_ios_qr %}<img class="qr" src="{{ abs_ios_qr }}"/><br/><span class="note">iOS</span>{% endif %}</td>
+      <td style="width:110pt;">{% if abs_android_qr %}<img class="qr" src="{{ abs_android_qr }}"/><br/><span class="note">Android</span>{% endif %}</td>
+    </tr></table>
+  </div>
+  {% endif %}
+
+  {% if show_requests %}
+  <div class="card">
+    <h2>Request New Books or Audiobooks</h2>
+    <table class="layout"><tr>
+      <td style="width:110pt;">{% if requests_qr %}<img class="qr" src="{{ requests_qr }}"/>{% endif %}</td>
+      <td><p>Or visit <span class="kv">{{ requests_url }}</span></p></td>
+    </tr></table>
+  </div>
+  {% endif %}
+
+  {% if show_shutdown %}
+  <div class="card">
+    <h2>Shutting Down</h2>
+    <p>Press and hold the shutdown button for about {{ shutdown_hold_secs }} seconds. The status
+    LEDs will flash a few times, then it's safe to unplug the power.</p>
+  </div>
+  {% endif %}
+
+  {% if show_leds %}
+  <div class="card">
+    <h2>LED Indicators</h2>
+    <p>&#9679; Green &mdash; Wi-Fi ready</p>
+    {% if show_ebooks %}<p>&#9679; Yellow &mdash; eBooks ready</p>{% endif %}
+    {% if show_audiobooks %}<p>&#9679; Blue &mdash; Audiobooks ready</p>{% endif %}
+  </div>
+  {% endif %}
+</body>
+</html>
+'''
+
+
+def _account_note(status, username, password):
+    """Turns a provisioning status (set by provision_accounts()) into the
+    login line shown on the welcome page — sourced entirely from what the
+    wizard actually configured/did, never a hand-typed note."""
+    if not status or status in ("not installed", "not attempted"):
+        return ""
+    if status.startswith("failed"):
+        reason = status.split(":", 1)[1].strip() if ":" in status else status
+        return f"Username: {username} / Password: {password} (please double-check — automatic setup didn't finish: {reason})"
+    return f"Username: {username} / Password: {password}"
+
+
+def _welcome_context(cfg):
+    """Everything both the HTML welcome page and the PDF need, computed
+    once from the wizard's own config/state so the two never disagree."""
     wifi_ip = cfg["wifi"]["ip"]
     show_ebooks = bool(cfg["apps"]["install_calibre_web"])
     show_audiobooks = bool(cfg["apps"]["install_audiobookshelf"])
@@ -1663,49 +2038,85 @@ def render_welcome_page(cfg):
     show_shutdown = bool(cfg["shutdown_button"]["enabled"])
     show_leds = bool(cfg["leds"]["enabled"])
 
+    username = cfg["apps"]["patron_username"]
+    password = cfg["apps"]["patron_password"]
+
     ebook_url = f"http://{wifi_ip}:8083"
     audiobook_url = f"http://{wifi_ip}:13378"
     requests_url = f"http://{wifi_ip}:{cfg['requests_page']['port']}"
 
+    cache = load_qr_cache()
+
+    return {
+        "logo_data_uri": LOGO_DATA_URI,
+        "wifi_ssid": cfg["wifi"]["ssid"],
+        "wifi_password": cfg["wifi"]["password"],
+        "show_ebooks": show_ebooks,
+        "show_audiobooks": show_audiobooks,
+        "show_requests": show_requests,
+        "show_shutdown": show_shutdown,
+        "show_leds": show_leds,
+        "ebook_url": ebook_url,
+        "audiobook_url": audiobook_url,
+        "requests_url": requests_url,
+        "ebook_login_note": _account_note(cfg["apps"]["calibre_account_status"], username, password) if show_ebooks else "",
+        "audiobook_login_note": _account_note(cfg["apps"]["audiobookshelf_account_status"], username, password) if show_audiobooks else "",
+        "shutdown_hold_secs": cfg["shutdown_button"]["hold_secs"],
+        "ebook_qr": get_cached_qr(cache, "ebook", ebook_url) if show_ebooks else "",
+        "abs_ios_qr": get_cached_qr(cache, "abs_ios", ABS_IOS_SEARCH_URL) if show_audiobooks else "",
+        "abs_android_qr": get_cached_qr(cache, "abs_android", ABS_ANDROID_SEARCH_URL) if show_audiobooks else "",
+        "requests_qr": get_cached_qr(cache, "requests", requests_url) if show_requests else "",
+    }
+
+
+def render_welcome_page(cfg):
     # render_template_string needs an app context; the /welcome route
     # already has one, but this is also called from the pipeline's
     # background thread (no request in flight), so make sure one exists
     # either way rather than crashing setup at the last step.
     with app.app_context():
-        return render_template_string(
-            WELCOME_PAGE_TEMPLATE,
-            logo_data_uri=LOGO_DATA_URI,
-            wifi_ssid=cfg["wifi"]["ssid"],
-            wifi_password=cfg["wifi"]["password"],
-            show_ebooks=show_ebooks,
-            show_audiobooks=show_audiobooks,
-            show_requests=show_requests,
-            show_shutdown=show_shutdown,
-            show_leds=show_leds,
-            ebook_url=ebook_url,
-            audiobook_url=audiobook_url,
-            requests_url=requests_url,
-            ebook_login_note=cfg["welcome"]["ebook_login_note"],
-            audiobook_login_note=cfg["welcome"]["audiobook_login_note"],
-            shutdown_hold_secs=cfg["shutdown_button"]["hold_secs"],
-            ebook_qr=generate_qr_data_uri(ebook_url) if show_ebooks else "",
-            abs_ios_qr=generate_qr_data_uri(ABS_IOS_SEARCH_URL) if show_audiobooks else "",
-            abs_android_qr=generate_qr_data_uri(ABS_ANDROID_SEARCH_URL) if show_audiobooks else "",
-            requests_qr=generate_qr_data_uri(requests_url) if show_requests else "",
-        )
+        return render_template_string(WELCOME_PAGE_TEMPLATE, **_welcome_context(cfg))
+
+
+def render_welcome_pdf_bytes(cfg):
+    """Renders the same welcome-page content as a PDF, using a simpler
+    table-based layout (xhtml2pdf doesn't support flexbox) so it prints
+    cleanly without needing a browser."""
+    from xhtml2pdf import pisa
+
+    with app.app_context():
+        html = render_template_string(WELCOME_PDF_TEMPLATE, **_welcome_context(cfg))
+
+    buf = io.BytesIO()
+    result = pisa.CreatePDF(html, dest=buf)
+    if result.err:
+        raise RuntimeError("xhtml2pdf reported errors generating the welcome PDF")
+    return buf.getvalue()
 
 
 def write_welcome_page(cfg, step_id):
-    """Renders the welcome/instructions page and saves a static copy in the
-    media folder (so it can be opened/printed even without the setup
-    wizard running), in addition to the live /welcome route."""
+    """Renders the welcome/instructions page (HTML + PDF) and saves static
+    copies in the media folder (so they can be opened/printed even
+    without the setup wizard running), in addition to the live
+    /welcome and /welcome.pdf routes."""
     html = render_welcome_page(cfg)
     media_root = cfg["storage"]["media_root"]
-    out_path = Path(media_root) / WELCOME_SCRIPT_PATH_NAME
-    write_file(out_path, html, step_id)
+    out_html = Path(media_root) / WELCOME_HTML_NAME
+    write_file(out_html, html, step_id)
+
+    try:
+        pdf_bytes = render_welcome_pdf_bytes(cfg)
+        out_pdf = Path(media_root) / WELCOME_PDF_NAME
+        out_pdf.parent.mkdir(parents=True, exist_ok=True)
+        out_pdf.write_bytes(pdf_bytes)
+        log_line(step_id, f"writing {out_pdf}")
+    except Exception as e:  # noqa: BLE001 - the HTML page still works without a PDF
+        log_line(step_id, f"Couldn't generate the printable PDF: {e}", level="error")
+
     log_line(
         step_id,
-        f"Welcome page ready — http://{cfg['wifi']['ip']}:9000/welcome (also saved to {out_path})",
+        f"Welcome page ready — http://{cfg['wifi']['ip']}:9000/welcome "
+        f"(printable PDF at /welcome.pdf, also saved under {media_root}).",
     )
 
 
@@ -1770,6 +2181,11 @@ def run_pipeline(cfg, storage_device, format_device):
             test_feature_led(cfg, "apps", cfg["leds"]["pin_abs"], "Audiobookshelf")
         set_step("apps", "done")
 
+        # accounts: create the patron login shown on the welcome page
+        set_step("accounts", "running")
+        provision_accounts(cfg, "accounts")
+        set_step("accounts", "done")
+
         # requests page
         set_step("requests_page", "running")
         install_requests_page(cfg, "requests_page")
@@ -1797,8 +2213,15 @@ def run_pipeline(cfg, storage_device, format_device):
         setup_shutdown_button(cfg, "shutdown_button")
         set_step("shutdown_button", "done")
 
+        # qr codes: install qrcode just long enough to bake in the images
+        # the welcome page needs, then remove it again
+        set_step("qr_codes", "running")
+        generate_and_cache_qr_codes(cfg, "qr_codes")
+        set_step("qr_codes", "done")
+
         # welcome page: generated last, once every feature's real on/off
-        # state (apps, requests page, LEDs, shutdown button) is known
+        # state (apps, requests page, LEDs, shutdown button, accounts, QR
+        # codes) is known
         set_step("welcome_page", "running")
         write_welcome_page(cfg, "welcome_page")
         set_step("welcome_page", "done")
@@ -1958,6 +2381,21 @@ FORM_TEMPLATE = """
             <label for="cweb">Install Calibre-Web</label>
           </div>
           <small>Docker will be installed automatically first if it isn't already present.</small>
+          <div class="row" style="margin-top:10px;">
+            <div>
+              <label>Patron account username
+                <input name="patron_username" value="{{ cfg.apps.patron_username }}">
+              </label>
+            </div>
+            <div>
+              <label>Patron account password
+                <input name="patron_password" value="{{ cfg.apps.patron_password }}">
+              </label>
+            </div>
+          </div>
+          <small>Setup creates this account automatically in Calibre-Web and/or Audiobookshelf
+          (whichever you install above) and shows it on the welcome page — you don't need to log
+          into either app yourself first.</small>
         </fieldset>
 
         <fieldset>
@@ -1976,16 +2414,10 @@ FORM_TEMPLATE = """
 
         <fieldset>
           <legend>Welcome / Instructions Page</legend>
-          <label>eBooks login note (shown to patrons)
-            <input name="ebook_login_note" value="{{ cfg.welcome.ebook_login_note }}">
-          </label>
-          <label>Audiobooks login note (shown to patrons)
-            <input name="audiobook_login_note" value="{{ cfg.welcome.audiobook_login_note }}">
-          </label>
           <small>After setup finishes, a printable welcome page is generated at
-          <code>/welcome</code> with the Lusty Library logo, Wi-Fi info, QR codes for eBooks,
-          Audiobooks, and requests, and (if enabled) the shutdown button and LED legend — only for
-          the features you actually installed.</small>
+          <code>/welcome</code> (and as a PDF at <code>/welcome.pdf</code>) with the Lusty Library
+          logo, Wi-Fi info, the patron account above, and QR codes for eBooks, Audiobooks, and
+          requests — only for the features you actually installed above.</small>
         </fieldset>
 
         <fieldset>
@@ -2123,7 +2555,9 @@ function showBanner(ok) {
   const b = document.getElementById("banner");
   b.className = ok ? "ok" : "fail";
   if (ok) {
-    b.innerHTML = 'Setup finished successfully. <a href="/welcome" target="_blank">View the welcome page &rarr;</a>';
+    b.innerHTML = 'Setup finished successfully. ' +
+      '<a href="/welcome" target="_blank">View the welcome page</a> &middot; ' +
+      '<a href="/welcome.pdf" target="_blank">Download the printable PDF</a>';
   } else {
     b.textContent = "Setup stopped due to an error — see the console below.";
   }
@@ -2267,6 +2701,8 @@ def setup_apply():
 
     cfg["apps"]["install_audiobookshelf"] = bool(data.get("install_audiobookshelf"))
     cfg["apps"]["install_calibre_web"] = bool(data.get("install_calibre_web"))
+    cfg["apps"]["patron_username"] = (data.get("patron_username") or "").strip() or cfg["apps"]["patron_username"]
+    cfg["apps"]["patron_password"] = (data.get("patron_password") or "").strip() or cfg["apps"]["patron_password"]
 
     cfg["requests_page"]["enabled"] = bool(data.get("requests_enabled"))
     try:
@@ -2298,9 +2734,6 @@ def setup_apply():
     except (TypeError, ValueError):
         pass
 
-    cfg["welcome"]["ebook_login_note"] = (data.get("ebook_login_note") or "").strip()
-    cfg["welcome"]["audiobook_login_note"] = (data.get("audiobook_login_note") or "").strip()
-
     save_config(cfg)
 
     thread = threading.Thread(target=run_pipeline, args=(cfg, storage_device, format_device), daemon=True)
@@ -2312,6 +2745,22 @@ def setup_apply():
 def welcome():
     cfg = load_config()
     return render_welcome_page(cfg)
+
+
+@app.route("/welcome.pdf")
+def welcome_pdf():
+    cfg = load_config()
+    media_root = Path(cfg["storage"]["media_root"])
+    saved_pdf = media_root / WELCOME_PDF_NAME
+    if saved_pdf.exists():
+        # Serve the copy generated during setup rather than re-rendering,
+        # so this always reflects exactly what setup produced.
+        return send_file(saved_pdf, mimetype="application/pdf", download_name="lusty-library-welcome.pdf")
+    try:
+        pdf_bytes = render_welcome_pdf_bytes(cfg)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": f"Couldn't generate the PDF: {e}"}), 500
+    return Response(pdf_bytes, mimetype="application/pdf")
 
 
 @app.route("/setup/state", methods=["GET"])
