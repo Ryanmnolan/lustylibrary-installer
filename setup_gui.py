@@ -50,6 +50,11 @@ def load_logo_data_uri():
 
 LOGO_DATA_URI = load_logo_data_uri()
 
+# A little book emoji, baked into an inline SVG, used only as the browser-tab
+# favicon. The full Lusty Library logo image is the header's main visual on
+# every page; this just gives the tab itself a recognizable icon.
+FAVICON_DATA_URI = "data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>%F0%9F%93%9A</text></svg>"
+
 
 def generate_qr_data_uri(data):
     """Generates a QR code as an inline PNG data URI, entirely offline (no
@@ -128,7 +133,9 @@ DEFAULT_CONFIG = {
     },
     "sync": {
         "enable_sync": False,
-        "server_ip": "192.168.0.139",
+        # left blank by default — this isn't pre-filled with anyone's real
+        # network info; the field's placeholder shows an example instead
+        "server_ip": "",
         "server_username": "",
         "server_password": "",
         "server_path_audio": "/data/media/audiobook",
@@ -797,6 +804,7 @@ REQUESTS_PAGE_TEMPLATE = '''
   <meta charset="utf-8">
   <title>Request a Book</title>
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% if favicon_data_uri %}<link rel="icon" href="{{ favicon_data_uri }}">{% endif %}
   <style>
     body { font-family: system-ui, sans-serif; background:#111827; color:#f9fafb; margin:0; }
     .wrap { max-width:900px; margin:4vh auto; padding:0 16px 40px; }
@@ -821,7 +829,7 @@ REQUESTS_PAGE_TEMPLATE = '''
     .empty { color:#9ca3af; font-style:italic; }
     small { color:#9ca3af; }
     .brand { display:flex; align-items:center; gap:14px; margin-bottom:4px; }
-    .brand img { height:56px; width:auto; }
+    .brand img { height:96px; width:auto; }
     .brand h1 { margin:0; }
   </style>
 </head>
@@ -830,7 +838,7 @@ REQUESTS_PAGE_TEMPLATE = '''
     <div class="card">
       <div class="brand">
         {% if logo_data_uri %}<img src="{{ logo_data_uri }}" alt="Lusty Library logo">{% endif %}
-        <h1>📚 Request a Book or Audiobook</h1>
+        <h1>Request a Book or Audiobook</h1>
       </div>
       <p><small>Can't find something in the library? Ask for it here.</small></p>
       <form method="post" action="/request">
@@ -901,6 +909,7 @@ def generate_requests_page_script(cfg):
     csv_path = str(Path(media_root) / "requests.csv")
     port = cfg["requests_page"]["port"]
     logo_data_uri = LOGO_DATA_URI
+    favicon_data_uri = FAVICON_DATA_URI
 
     return f'''#!/usr/bin/env python3
 """
@@ -923,6 +932,7 @@ LOCK = threading.Lock()
 
 PAGE = {REQUESTS_PAGE_TEMPLATE!r}
 LOGO_DATA_URI = {logo_data_uri!r}
+FAVICON_DATA_URI = {favicon_data_uri!r}
 
 
 def read_requests():
@@ -962,7 +972,7 @@ def set_status(request_id, status):
 def index():
     rows = read_requests()
     rows.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
-    return render_template_string(PAGE, rows=rows, logo_data_uri=LOGO_DATA_URI)
+    return render_template_string(PAGE, rows=rows, logo_data_uri=LOGO_DATA_URI, favicon_data_uri=FAVICON_DATA_URI)
 
 
 @app.route("/request", methods=["POST"])
@@ -1027,16 +1037,17 @@ WantedBy=multi-user.target
     run_cmd(["systemctl", "daemon-reload"], step_id, allow_fail=True)
     run_cmd(["systemctl", "enable", "--now", "lustylibrary-requests.service"], step_id, allow_fail=True)
 
-    time.sleep(1.0)
-    rc = run_cmd(
-        ["curl", "-s", "-o", "/dev/null", "-w", "Request page responded with HTTP %{http_code}", f"http://127.0.0.1:{port}/"],
-        step_id,
-        allow_fail=True,
-    )
-    if rc != 0:
+    # Flask/systemd can take a moment to actually bind the port after
+    # "enable --now" returns, so poll for a few seconds instead of checking
+    # once immediately — a single early check can report a false failure
+    # for a service that comes up fine a moment later.
+    up = _wait_for_http(f"http://127.0.0.1:{port}/", step_id, timeout=15)
+    if up:
+        log_line(step_id, f"Request page responding on port {port}.")
+    else:
         log_line(
             step_id,
-            f"Couldn't confirm the request page is responding on port {port} yet — "
+            f"Couldn't confirm the request page is responding on port {port} — "
             "check 'sudo systemctl status lustylibrary-requests.service'.",
             level="error",
         )
@@ -1801,8 +1812,25 @@ def generate_and_cache_qr_codes(cfg, step_id):
     save_qr_cache(cache)
     log_line(step_id, f"Cached {len(cache)}/{len(targets)} QR code(s) to {QR_CACHE_PATH}.")
 
-    run_cmd(["pip3", "uninstall", "-y", "-q", "qrcode"], step_id, allow_fail=True)
-    log_line(step_id, "Removed the 'qrcode' package again — not needed after this point.")
+    # The QR images are already safely cached above, so a failure to
+    # uninstall here doesn't affect functionality — but we still check the
+    # actual return code rather than assuming success, and retry with
+    # --break-system-packages (the same PEP 668 "externally-managed-
+    # environment" restriction that affects installs also affects
+    # uninstalls on newer Debian/Raspberry Pi OS releases).
+    rc = run_cmd(["pip3", "uninstall", "-y", "-q", "--break-system-packages", "qrcode"], step_id, allow_fail=True)
+    if rc != 0:
+        rc = run_cmd(["pip3", "uninstall", "-y", "-q", "qrcode"], step_id, allow_fail=True)
+    if rc == 0:
+        log_line(step_id, "Removed the 'qrcode' package again — not needed after this point.")
+    else:
+        log_line(
+            step_id,
+            "Couldn't remove the 'qrcode' package (not fatal — the QR images are already cached, "
+            "so the welcome page works fine either way). You can remove it by hand later with "
+            "'pip3 uninstall --break-system-packages qrcode' if you'd like.",
+            level="error",
+        )
 
     if not all_ok:
         log_line(step_id, "Some QR codes couldn't be verified; the welcome page will just show plain links for those.", level="error")
@@ -1815,6 +1843,7 @@ WELCOME_PAGE_TEMPLATE = '''
   <meta charset="utf-8">
   <title>Welcome to the Lusty Library</title>
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% if favicon_data_uri %}<link rel="icon" href="{{ favicon_data_uri }}">{% endif %}
   <style>
     body { font-family: system-ui, sans-serif; background:#faf6f0; color:#2b2118; margin:0; }
     .wrap { max-width:760px; margin:0 auto; padding:32px 20px 48px; }
@@ -1968,6 +1997,7 @@ def _welcome_context(cfg):
 
     return {
         "logo_data_uri": LOGO_DATA_URI,
+        "favicon_data_uri": FAVICON_DATA_URI,
         "wifi_ssid": cfg["wifi"]["ssid"],
         "wifi_password": cfg["wifi"]["password"],
         "show_ebooks": show_ebooks,
@@ -2303,6 +2333,7 @@ FORM_TEMPLATE = """
   <meta charset="utf-8">
   <title>Lusty Library Setup</title>
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  {% if favicon_data_uri %}<link rel="icon" href="{{ favicon_data_uri }}">{% endif %}
   <style>
     body { font-family: system-ui, sans-serif; background:#111827; color:#f9fafb; margin:0; }
     .wrap { max-width:900px; margin:4vh auto; padding:0 16px 40px; }
@@ -2343,7 +2374,7 @@ FORM_TEMPLATE = """
     #banner.fail { display:block; background:#450a0a; color:#fecaca; }
     #banner a { color:inherit; text-decoration:underline; }
     .brand { display:flex; align-items:center; gap:14px; }
-    .brand img { height:56px; width:auto; }
+    .brand img { height:96px; width:auto; }
     .brand h1 { margin:0; }
   </style>
 </head>
@@ -2352,7 +2383,7 @@ FORM_TEMPLATE = """
     <div class="card">
       <div class="brand">
         {% if logo_data_uri %}<img src="{{ logo_data_uri }}" alt="Lusty Library logo">{% endif %}
-        <h1>📚 Lusty Library Setup</h1>
+        <h1>Lusty Library Setup</h1>
       </div>
       <div class="board-info">
         Board: {{ board.model }} &middot; OS: {{ board.os_codename }} &middot; Arch: {{ board.arch }}
@@ -2712,6 +2743,7 @@ def setup():
         step_order=STEP_ORDER,
         step_order_json=json.dumps({sid: label for sid, label in STEP_ORDER}),
         logo_data_uri=LOGO_DATA_URI,
+        favicon_data_uri=FAVICON_DATA_URI,
     )
 
 

@@ -138,7 +138,10 @@ isn't kept as a permanent dependency. The welcome page and PDF read from
 that cache afterward, so they keep working correctly even after the
 package is gone and across service restarts. If installing `qrcode` fails
 (e.g. no network at that moment), the page just falls back to showing
-plain URLs instead of QR images.
+plain URLs instead of QR images. If the uninstall step itself can't remove
+the package afterward (rare, seen on some `externally-managed-environment`
+Python setups), the log says so honestly instead of claiming success — it's
+harmless either way since the QR images are already cached by that point.
 
 ## Auto-sync trigger
 
