@@ -1351,36 +1351,52 @@ def ensure_gpio_deps(step_id):
     return True
 
 
-def blink_led(pin, step_id, label, times=3, on_time=0.2, off_time=0.2, leave_on=False):
-    """Blinks a single LED a few times so the person can visually confirm
-    which physical LED corresponds to which pin/feature."""
+def blink_led(pin, step_id, label, times=3, on_time=0.2, off_time=0.2):
+    """Flashes a pin a few times so it's easy to spot which physical LED
+    corresponds to which pin/feature, then leaves it ON and returns the
+    still-open LED object. The caller is responsible for turning it off
+    (via _release_led) once done with it — turning it off right after the
+    flash, before the person has even seen the confirm question, defeats
+    the point of a visual test: by the time the browser round-trips the
+    question to them, the LED would already look dark either way. Returns
+    None (already logged) if the pin can't be driven at all."""
     try:
         from gpiozero import LED
     except ImportError:
         log_line(step_id, "gpiozero not available, cannot test LEDs.", level="error")
-        return False
+        return None
 
-    log_line(step_id, f"Blinking {label} LED on GPIO{pin} ({times}x)...")
+    log_line(step_id, f"Blinking {label} LED on GPIO{pin} ({times}x), then holding it on...")
     try:
-        with LED(pin) as led:
-            for _ in range(times):
-                led.on()
-                time.sleep(on_time)
-                led.off()
-                time.sleep(off_time)
-            if leave_on:
-                led.on()
-                time.sleep(0.5)
-                led.off()
-        return True
+        led = LED(pin)
+        for _ in range(times):
+            led.on()
+            time.sleep(on_time)
+            led.off()
+            time.sleep(off_time)
+        led.on()
+        return led
     except Exception as e:  # noqa: BLE001 - bad wiring/pin shouldn't kill setup
         log_line(step_id, f"Could not drive GPIO{pin} ({label}): {e}", level="error")
-        return False
+        return None
+
+
+def _release_led(led):
+    """Turns off and releases an LED object returned by blink_led(), if any."""
+    if led is None:
+        return
+    try:
+        led.off()
+        led.close()
+    except Exception:  # noqa: BLE001 - best effort cleanup, never worth failing setup over
+        pass
 
 
 def run_led_test_screen(cfg, step_id):
     """The general 'test screen': blinks every configured LED once, in
-    sequence, and asks a single yes/no question before moving on."""
+    sequence, then holds all three on solid while asking a single yes/no
+    question, so what's on the board still matches what's being asked
+    about instead of going dark before the person can answer."""
     if not cfg["leds"]["enabled"]:
         log_line(step_id, "Status LEDs disabled in setup, skipping LED tests.")
         return
@@ -1394,33 +1410,43 @@ def run_led_test_screen(cfg, step_id):
 
     leds = cfg["leds"]
     log_line(step_id, "Running through each configured LED so you can watch the board...")
-    blink_led(leds["pin_wifi"], step_id, "Wi-Fi", times=2)
-    blink_led(leds["pin_cweb"], step_id, "Calibre-Web", times=2)
-    blink_led(leds["pin_abs"], step_id, "Audiobookshelf", times=2)
-
-    answer = ask_confirm(
-        step_id,
-        f"Did all three LEDs (GPIO{leds['pin_wifi']}, GPIO{leds['pin_cweb']}, GPIO{leds['pin_abs']}) blink twice?",
-    )
-    if answer is False:
-        log_line(
+    held = [
+        blink_led(leds["pin_wifi"], step_id, "Wi-Fi", times=2),
+        blink_led(leds["pin_cweb"], step_id, "Calibre-Web", times=2),
+        blink_led(leds["pin_abs"], step_id, "Audiobookshelf", times=2),
+    ]
+    try:
+        answer = ask_confirm(
             step_id,
-            "Check wiring/pin numbers in the form above and re-run setup. "
-            "Continuing installation regardless — LEDs are cosmetic.",
-            level="error",
+            f"All three LEDs (GPIO{leds['pin_wifi']}, GPIO{leds['pin_cweb']}, GPIO{leds['pin_abs']}) "
+            "should be lit solid right now — are they?",
         )
+        if answer is False:
+            log_line(
+                step_id,
+                "Check wiring/pin numbers in the form above and re-run setup. "
+                "Continuing installation regardless — LEDs are cosmetic.",
+                level="error",
+            )
+    finally:
+        for led in held:
+            _release_led(led)
 
 
 def test_feature_led(cfg, step_id, pin, feature_label):
     """Called right after a specific feature (Wi-Fi, Calibre-Web,
     Audiobookshelf) comes up, so the test is tied to the thing it
-    indicates rather than only run once up front."""
+    indicates rather than only run once up front. Holds the LED on solid
+    through the confirm question, then releases it either way."""
     if not cfg["leds"]["enabled"] or not gpio_available():
         return
-    blink_led(pin, step_id, feature_label, times=3, leave_on=True)
-    answer = ask_confirm(step_id, f"Did the {feature_label} LED (GPIO{pin}) light up?")
-    if answer is False:
-        log_line(step_id, f"{feature_label} LED not confirmed working — check GPIO{pin} wiring.", level="error")
+    led = blink_led(pin, step_id, feature_label, times=3)
+    try:
+        answer = ask_confirm(step_id, f"The {feature_label} LED (GPIO{pin}) should be lit solid right now — is it?")
+        if answer is False:
+            log_line(step_id, f"{feature_label} LED not confirmed working — check GPIO{pin} wiring.", level="error")
+    finally:
+        _release_led(led)
 
 
 def generate_status_leds_script(cfg):
@@ -1602,34 +1628,45 @@ def test_shutdown_button(cfg, step_id):
         f"you have {SHUTDOWN_TEST_WINDOW_SECONDS}s. This will NOT power off the Pi.",
     )
 
-    result = {"held": None}
-    state = {"pressed_at": None}
-
-    def on_press():
-        state["pressed_at"] = time.monotonic()
-
-    def on_release():
-        if state["pressed_at"] is not None:
-            result["held"] = time.monotonic() - state["pressed_at"]
-
+    # Poll the raw pin state directly in this thread instead of relying on
+    # gpiozero's when_pressed/when_released event callbacks. Those callbacks
+    # depend on a background watcher thread of gpiozero's own getting set
+    # up correctly, which has proven unreliable specifically when this test
+    # runs inside the setup wizard's own background pipeline thread (this
+    # exact button works fine right after a reboot, once its own standalone
+    # systemd service runs it directly as the process's main thread) —
+    # polling is_pressed sidesteps that distinction entirely.
     try:
         btn = Button(pin, pull_up=True, bounce_time=0.05)
-        btn.when_pressed = on_press
-        btn.when_released = on_release
-        deadline = time.time() + SHUTDOWN_TEST_WINDOW_SECONDS
-        while time.time() < deadline and result["held"] is None:
-            time.sleep(0.1)
-        btn.close()
     except Exception as e:  # noqa: BLE001 - bad wiring/pin shouldn't kill setup
         log_line(step_id, f"Could not read GPIO{pin}: {e}", level="error")
         return False
 
-    if result["held"] is None:
+    held_for = None
+    pressed_at = None
+    was_pressed = False
+    try:
+        deadline = time.time() + SHUTDOWN_TEST_WINDOW_SECONDS
+        while time.time() < deadline and held_for is None:
+            is_pressed = btn.is_pressed
+            if is_pressed and not was_pressed:
+                pressed_at = time.monotonic()
+            elif not is_pressed and was_pressed and pressed_at is not None:
+                held_for = time.monotonic() - pressed_at
+            was_pressed = is_pressed
+            time.sleep(0.05)
+    except Exception as e:  # noqa: BLE001 - bad wiring/pin shouldn't kill setup
+        log_line(step_id, f"Could not read GPIO{pin}: {e}", level="error")
+        return False
+    finally:
+        btn.close()
+
+    if held_for is None:
         log_line(step_id, f"No press detected on GPIO{pin} within {SHUTDOWN_TEST_WINDOW_SECONDS}s.", level="error")
         return False
 
-    log_line(step_id, f"Detected a press on GPIO{pin}, held for {result['held']:.2f}s.")
-    if result["held"] >= hold_secs:
+    log_line(step_id, f"Detected a press on GPIO{pin}, held for {held_for:.2f}s.")
+    if held_for >= hold_secs:
         log_line(step_id, "That's long enough to trigger a shutdown once the service is running.")
     else:
         log_line(

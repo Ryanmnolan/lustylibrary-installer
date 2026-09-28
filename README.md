@@ -180,13 +180,17 @@ Check "I have status LEDs wired up" in the wizard and set the BCM pin for
 each of the Wi-Fi, Calibre-Web and Audiobookshelf LEDs (defaults 17/27/22,
 matching a stock 3-LED build). Setup then:
 
-1. Runs a **test screen** up front: blinks every configured LED twice and
-   asks you to confirm they all lit up, before installing anything.
+1. Runs a **test screen** up front: blinks every configured LED twice,
+   then holds all three on solid and asks you to confirm they're lit,
+   before installing anything. The LEDs stay on through the confirm
+   question itself (not just during the blink) so what's on the board
+   still matches what's being asked when you actually get to answer it.
 2. Tests **each LED again right when its own feature comes up** — the
    Wi-Fi LED after the hotspot is configured, and the Calibre-Web /
    Audiobookshelf LEDs after their containers start (only for apps you
-   chose to install) — each with its own yes/no confirmation. Setup
-   doesn't move past that step until you answer (or 15 minutes pass).
+   chose to install) — each held on solid with its own yes/no
+   confirmation. Setup doesn't move past that step until you answer (or
+   15 minutes pass).
 3. Only after everything else is verified does it install
    `/usr/local/bin/status_leds.py` and `lustylibrary-leds.service`, so
    the ongoing status service isn't fighting the tests for the same
@@ -207,7 +211,12 @@ and hold time (default 2.0s). Setup then:
 1. Actually waits for a real press on that pin (20-second window) and
    measures how long you held it — this is a hardware check, not a
    self-reported yes/no, so it also catches a wrong pin number or bad
-   wiring on its own.
+   wiring on its own. It polls the pin's raw state directly rather than
+   using gpiozero's press/release callbacks, since those depend on a
+   background watcher thread getting set up correctly, and that's proven
+   unreliable specifically when running inside the setup wizard's own
+   background thread — the same button reliably works once its own
+   standalone service takes over after a reboot.
 2. Installs `/usr/local/bin/shutdown_button.py` and
    `lustylibrary-shutdown-button.service` afterward regardless of the
    test result (a missed press during the 20s window doesn't mean the
@@ -256,6 +265,16 @@ instead of GND).
   login/setup forms; if a future Calibre-Web or Audiobookshelf release
   changes them, that one step logs a clear failure and setup continues —
   you'd just create the account by hand in that app's own UI instead.
+- **Calibre-Web's automatic account creation is currently unreliable** on
+  a brand-new library volume: the linuxserver.io image requires its own
+  one-time "Database Configuration" step (choosing/creating the calibre
+  library location) to be completed via its UI before `/admin/user/new`
+  actually works, and the wizard doesn't drive that step yet. Until that's
+  built, if the welcome page shows a Calibre-Web login that doesn't work,
+  open `http://<pi-ip>:8083/admin/`, log in as `admin`/`admin123`,
+  complete the "Database Configuration" screen (the default
+  `/app/calibre-web` value is fine), then create the patron user by hand
+  from the admin panel.
 - The welcome PDF uses a simpler layout than the on-screen welcome page
   (the PDF library doesn't support the same CSS), so print styling may
   differ slightly, but the content is identical.
