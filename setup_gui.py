@@ -1926,94 +1926,13 @@ WELCOME_PAGE_TEMPLATE = '''
 </html>
 '''
 
-# A separate, table-based layout for the PDF: xhtml2pdf (used to render it)
-# doesn't support flexbox, so the on-screen template above isn't reused
-# directly — this one shares the same context/data, just laid out simply.
-WELCOME_PDF_TEMPLATE = '''
-<html>
-<head>
-<style>
-  body { font-family: Helvetica, Arial, sans-serif; color:#2b2118; font-size:11pt; }
-  .center { text-align:center; }
-  h1 { text-align:center; color:#4a2e0a; font-size:22pt; margin-bottom:2pt; }
-  .subtitle { text-align:center; color:#8a6d4a; margin-bottom:16pt; font-size:11pt; }
-  .card { border:1pt solid #e7dcc9; padding:10pt; margin-bottom:12pt; }
-  .card h2 { color:#4a2e0a; font-size:14pt; margin:0 0 6pt 0; }
-  .kv { background-color:#faf6f0; font-family:Courier, monospace; padding:4pt 8pt; }
-  .note { color:#8a6d4a; font-size:9pt; }
-  table.layout { width:100%; }
-  table.layout td { vertical-align:top; padding-right:10pt; }
-  img.qr { width:100pt; height:100pt; }
-</style>
-</head>
-<body>
-  <div class="center">
-    {% if logo_data_uri %}<img src="{{ logo_data_uri }}" width="140" height="140"/>{% endif %}
-  </div>
-  <h1>Welcome to the Lusty Library</h1>
-  <p class="subtitle">Everything you need to connect, read, and listen.</p>
-
-  <div class="card">
-    <h2>Connect to Wi-Fi</h2>
-    <p>Network name (SSID): <span class="kv">{{ wifi_ssid }}</span></p>
-    <p>Password: <span class="kv">{{ wifi_password }}</span></p>
-  </div>
-
-  {% if show_ebooks %}
-  <div class="card">
-    <h2>eBooks</h2>
-    <table class="layout"><tr>
-      <td style="width:110pt;">{% if ebook_qr %}<img class="qr" src="{{ ebook_qr }}"/>{% endif %}</td>
-      <td>
-        <p>Open <span class="kv">{{ ebook_url }}</span> in a browser.</p>
-        {% if ebook_login_note %}<p class="note">{{ ebook_login_note }}</p>{% endif %}
-      </td>
-    </tr></table>
-  </div>
-  {% endif %}
-
-  {% if show_audiobooks %}
-  <div class="card">
-    <h2>Audiobooks</h2>
-    <p>Install the free Audiobookshelf app, then add this server address:</p>
-    <p><span class="kv">{{ audiobook_url }}</span></p>
-    {% if audiobook_login_note %}<p class="note">{{ audiobook_login_note }}</p>{% endif %}
-    <table class="layout"><tr>
-      <td style="width:110pt;">{% if abs_ios_qr %}<img class="qr" src="{{ abs_ios_qr }}"/><br/><span class="note">iOS</span>{% endif %}</td>
-      <td style="width:110pt;">{% if abs_android_qr %}<img class="qr" src="{{ abs_android_qr }}"/><br/><span class="note">Android</span>{% endif %}</td>
-    </tr></table>
-  </div>
-  {% endif %}
-
-  {% if show_requests %}
-  <div class="card">
-    <h2>Request New Books or Audiobooks</h2>
-    <table class="layout"><tr>
-      <td style="width:110pt;">{% if requests_qr %}<img class="qr" src="{{ requests_qr }}"/>{% endif %}</td>
-      <td><p>Or visit <span class="kv">{{ requests_url }}</span></p></td>
-    </tr></table>
-  </div>
-  {% endif %}
-
-  {% if show_shutdown %}
-  <div class="card">
-    <h2>Shutting Down</h2>
-    <p>Press and hold the shutdown button for about {{ shutdown_hold_secs }} seconds. The status
-    LEDs will flash a few times, then it's safe to unplug the power.</p>
-  </div>
-  {% endif %}
-
-  {% if show_leds %}
-  <div class="card">
-    <h2>LED Indicators</h2>
-    <p>&#9679; Green &mdash; Wi-Fi ready</p>
-    {% if show_ebooks %}<p>&#9679; Yellow &mdash; eBooks ready</p>{% endif %}
-    {% if show_audiobooks %}<p>&#9679; Blue &mdash; Audiobooks ready</p>{% endif %}
-  </div>
-  {% endif %}
-</body>
-</html>
-'''
+# The PDF is built directly with reportlab (see render_welcome_pdf_bytes)
+# rather than rendered from HTML. xhtml2pdf (an earlier approach here) pulls
+# in pyHanko for PDF-signing support we don't need, which drags in
+# cryptography/aiohttp/lxml — heavy, and on Debian's "externally managed"
+# Python, cryptography's distro package has no pip RECORD file, which makes
+# pip refuse to upgrade it even with --break-system-packages. reportlab
+# alone only needs Pillow (already required) and installs cleanly.
 
 
 def _account_note(status, username, password):
@@ -2078,19 +1997,133 @@ def render_welcome_page(cfg):
         return render_template_string(WELCOME_PAGE_TEMPLATE, **_welcome_context(cfg))
 
 
-def render_welcome_pdf_bytes(cfg):
-    """Renders the same welcome-page content as a PDF, using a simpler
-    table-based layout (xhtml2pdf doesn't support flexbox) so it prints
-    cleanly without needing a browser."""
-    from xhtml2pdf import pisa
+def _data_uri_to_buf(data_uri):
+    """Decodes a base64 data URI (as produced by load_logo_data_uri()/
+    get_cached_qr()) back to a BytesIO reportlab can use as an image
+    source. Returns None for an empty/invalid URI."""
+    if not data_uri or "," not in data_uri:
+        return None
+    try:
+        _, b64data = data_uri.split(",", 1)
+        return io.BytesIO(base64.b64decode(b64data))
+    except Exception:
+        return None
 
-    with app.app_context():
-        html = render_template_string(WELCOME_PDF_TEMPLATE, **_welcome_context(cfg))
+
+def render_welcome_pdf_bytes(cfg):
+    """Builds the welcome page as a PDF directly with reportlab (no HTML
+    rendering step involved), from the same context as the on-screen
+    welcome page, so the two always agree on content."""
+    from xml.sax.saxutils import escape
+
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.platypus import HRFlowable, Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    ctx = _welcome_context(cfg)
+
+    styles = getSampleStyleSheet()
+    heading_color = colors.HexColor("#4a2e0a")
+    muted_color = colors.HexColor("#8a6d4a")
+    rule_color = colors.HexColor("#e7dcc9")
+    kv_bg = colors.HexColor("#faf6f0")
+
+    title_style = ParagraphStyle("WelcomeTitle", parent=styles["Title"], textColor=heading_color, fontSize=22, alignment=TA_CENTER)
+    subtitle_style = ParagraphStyle("WelcomeSubtitle", parent=styles["Normal"], textColor=muted_color, alignment=TA_CENTER, spaceAfter=14)
+    heading_style = ParagraphStyle("CardHeading", parent=styles["Heading2"], textColor=heading_color, spaceAfter=4)
+    body_style = ParagraphStyle("CardBody", parent=styles["Normal"], spaceAfter=3, leading=14)
+    kv_style = ParagraphStyle(
+        "KV", parent=styles["Normal"], fontName="Courier", backColor=kv_bg, borderPadding=4, spaceAfter=3
+    )
+    note_style = ParagraphStyle("Note", parent=styles["Normal"], textColor=muted_color, fontSize=9)
+
+    story = []
+
+    logo_buf = _data_uri_to_buf(ctx["logo_data_uri"])
+    if logo_buf:
+        logo_img = Image(logo_buf, width=90, height=90)
+        logo_img.hAlign = "CENTER"
+        story.append(logo_img)
+        story.append(Spacer(1, 6))
+
+    story.append(Paragraph("Welcome to the Lusty Library", title_style))
+    story.append(Paragraph("Everything you need to connect, read, and listen.", subtitle_style))
+
+    def add_card(heading, flowables):
+        story.append(Paragraph(escape(heading), heading_style))
+        story.extend(flowables)
+        story.append(Spacer(1, 6))
+        story.append(HRFlowable(width="100%", thickness=0.75, color=rule_color))
+        story.append(Spacer(1, 10))
+
+    def with_qr(qr_data_uri, text_flowables, qr_size=80):
+        """Lays `text_flowables` next to a QR image (if one is cached),
+        or just returns them alone if there isn't one."""
+        qr_buf = _data_uri_to_buf(qr_data_uri)
+        if not qr_buf:
+            return text_flowables
+        qr_img = Image(qr_buf, width=qr_size, height=qr_size)
+        table = Table([[qr_img, text_flowables]], colWidths=[qr_size + 10, None])
+        table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (0, 0), 0)]))
+        return [table]
+
+    add_card("Connect to Wi-Fi", [
+        Paragraph(f"Network name (SSID): {escape(ctx['wifi_ssid'])}", kv_style),
+        Paragraph(f"Password: {escape(ctx['wifi_password'])}", kv_style),
+    ])
+
+    if ctx["show_ebooks"]:
+        text = [Paragraph(f"Open {escape(ctx['ebook_url'])} in a browser.", body_style)]
+        if ctx["ebook_login_note"]:
+            text.append(Paragraph(escape(ctx["ebook_login_note"]), note_style))
+        add_card("eBooks", with_qr(ctx["ebook_qr"], text))
+
+    if ctx["show_audiobooks"]:
+        flowables = [
+            Paragraph("Install the free Audiobookshelf app, then add this server address:", body_style),
+            Paragraph(escape(ctx["audiobook_url"]), kv_style),
+        ]
+        if ctx["audiobook_login_note"]:
+            flowables.append(Paragraph(escape(ctx["audiobook_login_note"]), note_style))
+        ios_buf = _data_uri_to_buf(ctx["abs_ios_qr"])
+        android_buf = _data_uri_to_buf(ctx["abs_android_qr"])
+        if ios_buf or android_buf:
+            row = []
+            if ios_buf:
+                row.append(Image(ios_buf, width=70, height=70))
+            if android_buf:
+                row.append(Image(android_buf, width=70, height=70))
+            qr_table = Table([row])
+            flowables.append(Spacer(1, 4))
+            flowables.append(qr_table)
+        add_card("Audiobooks", flowables)
+
+    if ctx["show_requests"]:
+        text = [Paragraph(f"Or visit {escape(ctx['requests_url'])}", body_style)]
+        add_card("Request New Books or Audiobooks", with_qr(ctx["requests_qr"], text))
+
+    if ctx["show_shutdown"]:
+        add_card("Shutting Down", [
+            Paragraph(
+                f"Press and hold the shutdown button for about {ctx['shutdown_hold_secs']} seconds. "
+                "The status LEDs will flash a few times, then it's safe to unplug the power.",
+                body_style,
+            )
+        ])
+
+    if ctx["show_leds"]:
+        led_lines = ["● Green — Wi-Fi ready"]
+        if ctx["show_ebooks"]:
+            led_lines.append("● Yellow — eBooks ready")
+        if ctx["show_audiobooks"]:
+            led_lines.append("● Blue — Audiobooks ready")
+        add_card("LED Indicators", [Paragraph(line, body_style) for line in led_lines])
 
     buf = io.BytesIO()
-    result = pisa.CreatePDF(html, dest=buf)
-    if result.err:
-        raise RuntimeError("xhtml2pdf reported errors generating the welcome PDF")
+    doc = SimpleDocTemplate(buf, pagesize=LETTER, topMargin=40, bottomMargin=40, leftMargin=54, rightMargin=54)
+    doc.build(story)
     return buf.getvalue()
 
 

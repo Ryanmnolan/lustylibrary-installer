@@ -107,7 +107,9 @@ cd "$INSTALL_DIR"
 
 step "Installing Python dependencies"
 if ! pip3 install --break-system-packages -r requirements.txt 2>&1 | tee -a "$LOG_FILE"; then
-  run pip3 install -r requirements.txt
+  log "First attempt failed (often a distro-packaged library, e.g. python3-cryptography," \
+      "with no pip RECORD file that pip won't touch) — retrying with --ignore-installed."
+  run pip3 install --break-system-packages --ignore-installed -r requirements.txt
 fi
 
 step "Installing Docker Engine (if needed)"

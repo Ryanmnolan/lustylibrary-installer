@@ -2,4 +2,4 @@ flask
 pyyaml
 requests
 Pillow
-xhtml2pdf
+reportlab
