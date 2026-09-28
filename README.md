@@ -87,11 +87,18 @@ Under "Apps to install," set a single patron username/password (default
 apps you installed and creates that account for real:
 
 - **Calibre-Web**: logs in with the app's documented first-run admin
-  account (`admin`/`admin123`) and submits its own "add user" form to
-  create the patron account — the same form the web UI itself uses, not a
-  private API. Calibre-Web's own first-run database setup can still be
-  finishing even after its web server starts responding (especially on a
-  Pi 3), so this retries the whole login-then-create flow for a couple of
+  account (`admin`/`admin123`), drives its one-time "Database
+  Configuration" step (pointing it at the books folder) the same way its
+  own setup wizard would, then submits its "add user" form to create the
+  patron account — all three are the actual forms the web UI itself uses,
+  not a private API. Calibre-Web refuses to leave that Database
+  Configuration step until a *valid* library already exists at the path
+  you give it, and never creates one itself, so the wizard also creates a
+  fresh empty Calibre library (`calibre_empty_library.sql`, the same
+  schema Calibre itself generates for any new library) at the books path
+  the first time, if one isn't already there. Calibre-Web's own first-run
+  setup can still be finishing even after its web server starts responding
+  (especially on a Pi 3), so this retries the whole flow for a couple of
   minutes before giving up.
 - **Audiobookshelf**: uses the server's one-time setup flow (`/status` +
   `/init`) to set the patron username/password as the root account. If the
@@ -265,16 +272,12 @@ instead of GND).
   login/setup forms; if a future Calibre-Web or Audiobookshelf release
   changes them, that one step logs a clear failure and setup continues —
   you'd just create the account by hand in that app's own UI instead.
-- **Calibre-Web's automatic account creation is currently unreliable** on
-  a brand-new library volume: the linuxserver.io image requires its own
-  one-time "Database Configuration" step (choosing/creating the calibre
-  library location) to be completed via its UI before `/admin/user/new`
-  actually works, and the wizard doesn't drive that step yet. Until that's
-  built, if the welcome page shows a Calibre-Web login that doesn't work,
-  open `http://<pi-ip>:8083/admin/`, log in as `admin`/`admin123`,
-  complete the "Database Configuration" screen (the default
-  `/app/calibre-web` value is fine), then create the patron user by hand
-  from the admin panel.
+- If Calibre-Web's account still isn't showing up after setup (a future
+  release changed its forms, or something about the library path didn't
+  take), the fallback is still manual: open `http://<pi-ip>:8083/admin/`,
+  log in as `admin`/`admin123`, complete "Database Configuration" if it's
+  still asking (the books folder is already mounted at `/books` inside the
+  container), then create the patron user from the admin panel.
 - The welcome PDF uses a simpler layout than the on-screen welcome page
   (the PDF library doesn't support the same CSS), so print styling may
   differ slightly, but the content is identical.
