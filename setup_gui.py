@@ -19,9 +19,11 @@ import json
 import os
 import platform
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from flask import Flask, Response, request, render_template_string, redirect, url_for, jsonify, send_file
@@ -653,6 +655,39 @@ def bring_up_apps(compose_path, step_id):
 
 CALIBRE_DEFAULT_ADMIN_USER = "admin"
 CALIBRE_DEFAULT_ADMIN_PASSWORD = "admin123"  # linuxserver/calibre-web's documented first-run default
+CALIBRE_LIBRARY_PATH_IN_CONTAINER = "/books"  # matches the volume mount in generate_docker_compose()
+CALIBRE_EMPTY_LIBRARY_SCHEMA_PATH = Path(__file__).resolve().parent / "calibre_empty_library.sql"
+
+
+def ensure_calibre_library(cfg, step_id):
+    """Calibre-Web's first-run 'Database Configuration' step refuses to
+    accept a library path unless a *valid* metadata.db already exists
+    there — it never creates one itself (confirmed by reading Calibre-Web's
+    own source). So before that step can ever be automated, make sure a
+    genuine, empty Calibre library is already sitting at the configured
+    books path. Never touches anything if a metadata.db is already there
+    (a re-run, or a real library someone dropped in) — this only ever
+    creates one from nothing."""
+    books_dir = Path(cfg["storage"]["media_root"]) / "books"
+    metadata_db = books_dir / "metadata.db"
+    if metadata_db.exists():
+        log_line(step_id, "Calibre library already exists, leaving it as-is.")
+        return
+
+    try:
+        books_dir.mkdir(parents=True, exist_ok=True)
+        schema_sql = CALIBRE_EMPTY_LIBRARY_SCHEMA_PATH.read_text()
+        conn = sqlite3.connect(str(metadata_db))
+        try:
+            conn.executescript(schema_sql)
+            conn.execute("UPDATE library_id SET uuid = ?", (str(uuid.uuid4()),))
+            conn.commit()
+        finally:
+            conn.close()
+        log_line(step_id, f"Created a fresh, empty Calibre library at {metadata_db}.")
+    except Exception as e:  # noqa: BLE001 - best effort; Calibre-Web will just show its own setup wizard
+        log_line(step_id, f"Couldn't create an empty Calibre library ({e}); you may need to complete "
+                           "Calibre-Web's Database Configuration step by hand.", level="error")
 
 
 def _wait_for_http(url, step_id, timeout=90):
@@ -695,9 +730,30 @@ def _try_provision_calibre_web_account(base, username, password):
     if "login" in resp.url and resp.status_code == 200:
         raise RuntimeError("login page still shown after posting default admin credentials")
 
+    # Calibre-Web won't let ANY other admin route through until its own
+    # one-time "Database Configuration" step is done — it redirects every
+    # request back to /admin/dbconfig until a library path is set. Drive
+    # that same form the setup wizard itself would show you, every time;
+    # if it's already configured this is just a harmless re-save of the
+    # same value. ensure_calibre_library() (called earlier, in the "apps"
+    # step) guarantees a valid empty library already exists at this path,
+    # since Calibre-Web will refuse the path otherwise and never creates
+    # one on its own.
+    dbconfig_page = session.get(f"{base}/admin/dbconfig", timeout=10)
+    token = _extract_csrf_token(dbconfig_page.text)
+    dbconfig_form = {"config_calibre_dir": CALIBRE_LIBRARY_PATH_IN_CONTAINER}
+    if token:
+        dbconfig_form["csrf_token"] = token
+    resp = session.post(f"{base}/admin/dbconfig", data=dbconfig_form, timeout=10)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"HTTP {resp.status_code} setting the Calibre library path")
+
     new_user_page = session.get(f"{base}/admin/user/new", timeout=10)
-    if "login" in new_user_page.url:
-        raise RuntimeError("admin page redirected back to login — the session didn't actually authenticate")
+    if "user/new" not in new_user_page.url:
+        raise RuntimeError(
+            f"admin page redirected to {new_user_page.url} instead of the new-user form "
+            "(Calibre-Web still doesn't consider itself configured)"
+        )
     token = _extract_csrf_token(new_user_page.text)
     form = {
         "name": username,
@@ -2336,6 +2392,8 @@ def run_pipeline(cfg, storage_device, format_device):
         # apps
         set_step("apps", "running")
         compose_path = generate_docker_compose(cfg, "apps")
+        if cfg["apps"]["install_calibre_web"]:
+            ensure_calibre_library(cfg, "apps")
         bring_up_apps(compose_path, "apps")
         if cfg["apps"]["install_calibre_web"]:
             test_feature_led(cfg, "apps", cfg["leds"]["pin_cweb"], "Calibre-Web")
