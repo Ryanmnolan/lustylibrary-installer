@@ -1269,24 +1269,57 @@ def ensure_gpio_deps(step_id):
     try:
         import gpiozero  # noqa: F401
         log_line(step_id, "gpiozero already installed.")
-        return True
     except ImportError:
-        pass
+        log_line(step_id, "Installing gpiozero (and lgpio backend) for LED control...")
+        rc = run_cmd(["apt-get", "install", "-y", "python3-gpiozero", "python3-rpi-lgpio"], step_id, allow_fail=True)
+        if rc != 0:
+            rc = run_cmd(
+                ["pip3", "install", "--break-system-packages", "gpiozero", "rpi-lgpio"],
+                step_id,
+                allow_fail=True,
+            )
+        try:
+            import gpiozero  # noqa: F401
+        except ImportError:
+            log_line(step_id, "Could not import gpiozero after install attempt.", level="error")
+            return False
 
-    log_line(step_id, "Installing gpiozero (and lgpio backend) for LED control...")
-    rc = run_cmd(["apt-get", "install", "-y", "python3-gpiozero", "python3-rpi-lgpio"], step_id, allow_fail=True)
-    if rc != 0:
-        rc = run_cmd(
-            ["pip3", "install", "--break-system-packages", "gpiozero", "rpi-lgpio"],
-            step_id,
-            allow_fail=True,
-        )
+    # `import gpiozero` succeeding doesn't prove there's a *working* GPIO
+    # backend behind it — on newer Raspberry Pi OS releases (Bookworm and
+    # trixie), the classic RPi.GPIO module can be present without being
+    # able to actually drive a pin on the new kernel GPIO interface, which
+    # needs the lgpio-backed replacement instead. Resolving (and logging)
+    # the real backend here means a "no error, but nothing lit up" failure
+    # later already has its answer sitting in this log, instead of only
+    # showing up once someone SSHes in to dig further.
     try:
-        import gpiozero  # noqa: F401
-        return True
-    except ImportError:
-        log_line(step_id, "Could not import gpiozero after install attempt.", level="error")
+        import gpiozero
+
+        gpiozero.Device.ensure_pin_factory()
+        factory = gpiozero.Device.pin_factory
+        factory_name = f"{type(factory).__module__}.{type(factory).__name__}"
+        log_line(step_id, f"GPIO backend in use: {factory_name}")
+        if "mock" in factory_name.lower():
+            log_line(
+                step_id,
+                "gpiozero is using its MOCK pin factory — it reports success without touching "
+                "real hardware. Something has GPIOZERO_PIN_FACTORY=mock set in the environment; "
+                "LEDs/the shutdown button won't work until that's removed.",
+                level="error",
+            )
+            return False
+    except Exception as e:  # noqa: BLE001 - report clearly rather than let a later, vaguer failure happen
+        log_line(
+            step_id,
+            f"gpiozero imported, but couldn't set up a working GPIO backend: {e}. On newer "
+            "Raspberry Pi OS releases this usually means the lgpio backend didn't install "
+            "correctly — try 'sudo apt-get install -y python3-rpi-lgpio' or "
+            "'sudo pip3 install --break-system-packages rpi-lgpio' by hand, then re-run setup.",
+            level="error",
+        )
         return False
+
+    return True
 
 
 def blink_led(pin, step_id, label, times=3, on_time=0.2, off_time=0.2, leave_on=False):

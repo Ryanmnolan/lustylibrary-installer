@@ -213,6 +213,31 @@ LEDs are enabled), flashes all configured LEDs a few times, then calls
 `poweroff`. It runs as its own root systemd service, so it doesn't need
 passwordless `sudo` configured for any user.
 
+## Troubleshooting LEDs / the shutdown button
+
+If a status LED or the shutdown button doesn't respond, but the setup log
+shows no error for that step, the setup wizard now checks and logs which
+GPIO backend gpiozero actually resolved to (`GPIO backend in use: ...`) —
+check that line in the console/install log first. On newer Raspberry Pi OS
+releases (Bookworm and trixie), the classic `RPi.GPIO` module can import
+fine without being able to drive a pin at all, unless the `rpi-lgpio`
+replacement is installed; the wizard now catches this and reports it
+instead of silently continuing.
+
+For a manual, standalone check (no need to re-run the whole wizard), SSH
+into the Pi and run:
+
+```bash
+sudo python3 /opt/lustylibrary-installer/gpio_diagnostic.py
+```
+
+It prints the GPIO backend in use, then walks through each configured LED
+(solid on for 5s, one at a time, asking you to confirm) and watches the
+button pin's raw state for 15s so you can see whether a press registers at
+all. That isolates a software/backend problem from a wiring problem (wrong
+pin, reversed LED polarity, missing resistor, or a button wired to 3.3V
+instead of GND).
+
 ## Known limitations
 
 - The setup wizard has no login and runs as root — only expose port 9000
