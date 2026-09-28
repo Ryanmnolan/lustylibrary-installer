@@ -89,7 +89,10 @@ apps you installed and creates that account for real:
 - **Calibre-Web**: logs in with the app's documented first-run admin
   account (`admin`/`admin123`) and submits its own "add user" form to
   create the patron account — the same form the web UI itself uses, not a
-  private API.
+  private API. Calibre-Web's own first-run database setup can still be
+  finishing even after its web server starts responding (especially on a
+  Pi 3), so this retries the whole login-then-create flow for a couple of
+  minutes before giving up.
 - **Audiobookshelf**: uses the server's one-time setup flow (`/status` +
   `/init`) to set the patron username/password as the root account. If the
   server was already initialized (e.g. re-running setup), it just confirms
@@ -97,7 +100,9 @@ apps you installed and creates that account for real:
 
 Both are best-effort and non-fatal — if a login page or form has changed
 in a newer app version, the step logs exactly what failed (status codes,
-etc.) and setup keeps going rather than aborting. Whatever actually
+etc.) and setup keeps going rather than aborting. If Calibre-Web's account
+still can't be auto-created after retrying, the log tells you how to add
+it by hand at `http://<pi-ip>:8083/admin/user/new`. Whatever actually
 happened (`created`, `already exists`, or `failed: ...`) is what shows up
 on the welcome page — never a hand-typed note that might not match reality.
 

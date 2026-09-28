@@ -679,6 +679,41 @@ def _extract_csrf_token(html):
     return m.group(1) if m else None
 
 
+def _try_provision_calibre_web_account(base, username, password):
+    """One attempt at the login-then-create-user flow. Raises on any
+    problem (bad login, session not actually authenticated, HTTP error)
+    so the caller can retry — Calibre-Web's own first-run database setup
+    (seeding the default admin user) can still be finishing even after its
+    web server starts responding, especially on slower boards."""
+    session = requests.Session()
+    login_page = session.get(f"{base}/login", timeout=10)
+    token = _extract_csrf_token(login_page.text)
+    login_data = {"username": CALIBRE_DEFAULT_ADMIN_USER, "password": CALIBRE_DEFAULT_ADMIN_PASSWORD}
+    if token:
+        login_data["csrf_token"] = token
+    resp = session.post(f"{base}/login", data=login_data, timeout=10)
+    if "login" in resp.url and resp.status_code == 200:
+        raise RuntimeError("login page still shown after posting default admin credentials")
+
+    new_user_page = session.get(f"{base}/admin/user/new", timeout=10)
+    if "login" in new_user_page.url:
+        raise RuntimeError("admin page redirected back to login — the session didn't actually authenticate")
+    token = _extract_csrf_token(new_user_page.text)
+    form = {
+        "name": username,
+        "email": f"{username}@lustylibrary.local",
+        "password": password,
+        "kobo_support": "",
+        "download_role": "on",
+        "viewer_role": "on",
+    }
+    if token:
+        form["csrf_token"] = token
+    resp = session.post(f"{base}/admin/user/new", data=form, timeout=10)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"HTTP {resp.status_code} creating user")
+
+
 def provision_calibre_web_account(cfg, step_id):
     """Logs into Calibre-Web with its documented first-run admin account
     and creates (or updates) the patron account shown on the welcome page,
@@ -691,45 +726,39 @@ def provision_calibre_web_account(cfg, step_id):
         cfg["apps"]["calibre_account_status"] = "failed: Calibre-Web never came up"
         return
 
-    session = requests.Session()
-    try:
-        login_page = session.get(f"{base}/login", timeout=10)
-        token = _extract_csrf_token(login_page.text)
-        login_data = {"username": CALIBRE_DEFAULT_ADMIN_USER, "password": CALIBRE_DEFAULT_ADMIN_PASSWORD}
-        if token:
-            login_data["csrf_token"] = token
-        resp = session.post(f"{base}/login", data=login_data, timeout=10)
-        if "login" in resp.url and resp.status_code == 200:
-            log_line(
-                step_id,
-                "Calibre-Web admin login didn't look successful (default admin/admin123 may already "
-                "have been changed) — skipping automatic patron account creation.",
-                level="error",
-            )
-            cfg["apps"]["calibre_account_status"] = "failed: could not log in as default admin"
+    # Calibre-Web's web server can start answering requests before its own
+    # first-run setup (seeding the default admin user in its database) has
+    # actually finished — on a slower board like a Pi 3 that can take a
+    # while. Retry the whole flow a few times instead of giving up after
+    # one attempt right after the container starts.
+    attempts = 6
+    delay_secs = 15
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            _try_provision_calibre_web_account(base, username, password)
+            log_line(step_id, f"Calibre-Web patron account '{username}' created.")
+            cfg["apps"]["calibre_account_status"] = "created"
             return
+        except Exception as e:  # noqa: BLE001 - best effort, retry a few times then give up gracefully
+            last_error = e
+            if attempt < attempts:
+                log_line(
+                    step_id,
+                    f"Calibre-Web account setup attempt {attempt}/{attempts} didn't work yet ({e}); "
+                    f"retrying in {delay_secs}s — Calibre-Web can take a while to finish its own "
+                    "first-run setup.",
+                )
+                time.sleep(delay_secs)
 
-        new_user_page = session.get(f"{base}/admin/user/new", timeout=10)
-        token = _extract_csrf_token(new_user_page.text)
-        form = {
-            "name": username,
-            "email": f"{username}@lustylibrary.local",
-            "password": password,
-            "kobo_support": "",
-            "download_role": "on",
-            "viewer_role": "on",
-        }
-        if token:
-            form["csrf_token"] = token
-        resp = session.post(f"{base}/admin/user/new", data=form, timeout=10)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"HTTP {resp.status_code} creating user")
-
-        log_line(step_id, f"Calibre-Web patron account '{username}' created.")
-        cfg["apps"]["calibre_account_status"] = "created"
-    except Exception as e:  # noqa: BLE001 - best effort, never fail the install over this
-        log_line(step_id, f"Couldn't auto-create the Calibre-Web patron account: {e}", level="error")
-        cfg["apps"]["calibre_account_status"] = f"failed: {e}"
+    log_line(
+        step_id,
+        f"Couldn't auto-create the Calibre-Web patron account after {attempts} attempts: {last_error}. "
+        "You can create it by hand at http://<pi-ip>:8083/admin/user/new (default admin login: "
+        f"{CALIBRE_DEFAULT_ADMIN_USER}/{CALIBRE_DEFAULT_ADMIN_PASSWORD}).",
+        level="error",
+    )
+    cfg["apps"]["calibre_account_status"] = f"failed: {last_error}"
 
 
 def provision_audiobookshelf_account(cfg, step_id):
