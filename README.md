@@ -41,3 +41,10 @@ service. Then open:
 ```
 http://<pi-ip>:9000/setup
 ```
+
+## Uninstall
+
+```bash
+sudo bash /opt/lustylibrary-installer/uninstall.sh          # keep library data
+sudo bash /opt/lustylibrary-installer/uninstall.sh --purge-data   # wipe it too
+```
