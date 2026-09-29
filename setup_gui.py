@@ -788,12 +788,28 @@ def _try_provision_calibre_web_account(base, username, password):
         "kobo_support": "",
         "download_role": "on",
         "viewer_role": "on",
+        # Calibre-Web's own new-user handler reads to_save["default_language"]
+        # with a plain dict lookup (no default) — omitting it throws an
+        # uncaught KeyError server-side, which is the HTTP 500 this was
+        # producing. "all" is the built-in "Show All" option, always valid
+        # regardless of what's in the library. "locale" (UI language) has a
+        # safe fallback in Calibre-Web itself, but we set it explicitly too
+        # rather than lean on that.
+        "default_language": "all",
+        "locale": "en",
     }
     if token:
         form["csrf_token"] = token
     resp = session.post(f"{base}/admin/user/new", data=form, timeout=10)
     if resp.status_code >= 400:
         raise RuntimeError(f"HTTP {resp.status_code} creating user")
+    if "user/new" in resp.url and "Oops" in resp.text:
+        # Calibre-Web returns 200 and re-renders the same "Add New User"
+        # form (rather than redirecting to the admin page) when the fields
+        # it got fail its own validation, e.g. a name/email collision from
+        # a previous attempt — raise so this is visible and retried/reported
+        # instead of being mistaken for success.
+        raise RuntimeError("Calibre-Web rejected the new-user form (see its own error/flash message)")
 
 
 def provision_calibre_web_account(cfg, step_id):
