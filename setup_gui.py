@@ -359,6 +359,25 @@ def write_file(path, content, step_id, mode=None):
 # ---------------------------------------------------------------------------
 
 
+def validate_wifi_settings(cfg):
+    """WPA2-PSK requires an 8-63 character passphrase and a 1-32 byte SSID;
+    NetworkManager and wpa_supplicant both reject anything outside those
+    ranges with a fairly cryptic "property is invalid" error buried deep in
+    the pipeline. Catch it up front with a plain-English message instead."""
+    errors = []
+    ssid = cfg["wifi"]["ssid"]
+    password = cfg["wifi"]["password"]
+    ssid_len = len(ssid.encode("utf-8"))
+    if not (1 <= ssid_len <= 32):
+        errors.append(f"Wi-Fi network name must be 1-32 characters (\"{ssid}\" is {ssid_len}).")
+    if not (8 <= len(password) <= 63):
+        errors.append(
+            f"Wi-Fi password must be 8-63 characters — this is a WPA2 requirement, not "
+            f"something Lusty Library can relax (\"{password}\" is {len(password)})."
+        )
+    return errors
+
+
 def detect_network_backend():
     if shutil.which("nmcli"):
         rc = subprocess.run(
@@ -481,6 +500,13 @@ def apply_wifi_config_dhcpcd(cfg, step_id):
 
 
 def apply_wifi_config(cfg, step_id):
+    errors = validate_wifi_settings(cfg)
+    if errors:
+        # setup_apply() already rejects these before the pipeline ever
+        # starts, but this is the same check as a backstop in case
+        # config.yml was hand-edited directly (or an old one carried over).
+        raise StepFailed(" ".join(errors))
+
     backend = detect_network_backend()
     log_line(step_id, f"Detected network backend: {backend}")
     if backend == "networkmanager":
@@ -2559,7 +2585,9 @@ FORM_TEMPLATE = """
             </div>
             <div>
               <label>Password
-                <input name="wifi_password" value="{{ cfg.wifi.password }}" placeholder="e.g. lustybooks123">
+                <input name="wifi_password" value="{{ cfg.wifi.password }}" placeholder="e.g. lustybooks123"
+                       minlength="8" maxlength="63" title="8-63 characters (WPA2 requirement)">
+                <small>Must be 8-63 characters — WPA2 won't accept anything shorter.</small>
               </label>
             </div>
           </div>
@@ -2916,6 +2944,10 @@ def setup_apply():
     cfg["wifi"]["ssid"] = (data.get("wifi_ssid") or "").strip() or cfg["wifi"]["ssid"]
     cfg["wifi"]["password"] = (data.get("wifi_password") or "").strip() or cfg["wifi"]["password"]
     cfg["wifi"]["ip"] = (data.get("wifi_ip") or "").strip() or cfg["wifi"]["ip"]
+
+    wifi_errors = validate_wifi_settings(cfg)
+    if wifi_errors:
+        return jsonify({"error": " ".join(wifi_errors)}), 400
 
     cfg["storage"]["media_root"] = (data.get("media_root") or "").strip() or cfg["storage"]["media_root"]
     storage_device = (data.get("storage_device") or "").strip()
