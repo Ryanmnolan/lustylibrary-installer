@@ -818,6 +818,60 @@ def _try_provision_calibre_web_account(base, username, password):
     if resp.status_code >= 400:
         raise RuntimeError(f"HTTP {resp.status_code} setting the Calibre library path")
 
+    _calibre_create_user(session, base, username, password)
+
+    # Don't trust "no error shown" — prove the patron account really works
+    # by logging in as it from a brand-new session.
+    check = requests.Session()
+    page = check.get(f"{base}/login", timeout=10)
+    data = {"username": username, "password": password}
+    token = _extract_csrf_token(page.text)
+    if token:
+        data["csrf_token"] = token
+    resp = check.post(f"{base}/login", data=data, timeout=10)
+    if "login" in resp.url and resp.status_code == 200:
+        raise RuntimeError(f"created '{username}' but logging in as it still fails")
+
+
+def _calibre_flash_text(html):
+    """Best-effort: the red/green message Calibre-Web flashed on the page."""
+    import re
+
+    import html as html_lib
+
+    # Returns (category, text) of the last flashed message, e.g.
+    # ("success", "User 'book' created") or ("danger", "Password doesn't ...").
+    found = re.findall(r'<div[^>]*id="flash_(\w+)"[^>]*>(.*?)</div>', html, re.S)
+    if not found:
+        return "", ""
+    category, body = found[-1]
+    return category, html_lib.unescape(re.sub(r"<[^>]+>", " ", body)).strip()
+
+
+def _calibre_disable_password_rules(session, base):
+    """Calibre-Web ships with a password policy on (8+ characters and a mix
+    of upper/lower case, digits and symbols) that rejects a simple patron
+    login like book/book. This is a public offline library with a shared
+    login, so turn the policy off — through the same settings form an admin
+    would use. Checkboxes we leave out are reset by Calibre-Web, so the ones
+    that are on by default and shouldn't change are sent as on."""
+    page = session.get(f"{base}/admin/config", timeout=10)
+    token = _extract_csrf_token(page.text)
+    form = {
+        "config_password_min_length": "1",
+        "config_check_extensions": "on",
+        "config_embed_metadata": "on",
+        "config_ratelimiter": "on",
+    }
+    headers = {"X-CSRFToken": token} if token else {}
+    if token:
+        form["csrf_token"] = token
+    resp = session.post(f"{base}/admin/ajaxconfig", data=form, headers=headers, timeout=15)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"HTTP {resp.status_code} turning off Calibre-Web's password rules")
+
+
+def _calibre_create_user(session, base, username, password):
     new_user_page = session.get(f"{base}/admin/user/new", timeout=10)
     if "user/new" not in new_user_page.url:
         raise RuntimeError(
@@ -844,16 +898,28 @@ def _try_provision_calibre_web_account(base, username, password):
     }
     if token:
         form["csrf_token"] = token
-    resp = session.post(f"{base}/admin/user/new", data=form, timeout=10)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"HTTP {resp.status_code} creating user")
-    if "user/new" in resp.url and "Oops" in resp.text:
-        # Calibre-Web returns 200 and re-renders the same "Add New User"
-        # form (rather than redirecting to the admin page) when the fields
-        # it got fail its own validation, e.g. a name/email collision from
-        # a previous attempt — raise so this is visible and retried/reported
-        # instead of being mistaken for success.
-        raise RuntimeError("Calibre-Web rejected the new-user form (see its own error/flash message)")
+
+    for attempt in (1, 2):
+        resp = session.post(f"{base}/admin/user/new", data=form, timeout=10)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"HTTP {resp.status_code} creating user")
+        if "user/new" not in resp.url:
+            return  # redirected to the user list: created
+        # Calibre-Web answers 200 and re-shows the "Add New User" form when
+        # it refuses the user. Read its own message instead of guessing.
+        category, message = _calibre_flash_text(resp.text)
+        if category == "success":
+            return  # created (this Calibre-Web version re-shows the form with a success message)
+        if "existing account" in message.lower() or "already exists" in message.lower():
+            return  # a re-run: the login check right after this proves the password still works
+        if attempt == 1 and "password" in message.lower():
+            _calibre_disable_password_rules(session, base)
+            new_user_page = session.get(f"{base}/admin/user/new", timeout=10)
+            token = _extract_csrf_token(new_user_page.text)
+            if token:
+                form["csrf_token"] = token
+            continue
+        raise RuntimeError(f"Calibre-Web rejected the new user: {message or 'no reason shown'}")
 
 
 def provision_calibre_web_account(cfg, step_id):
