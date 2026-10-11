@@ -444,6 +444,7 @@ def apply_wifi_config_networkmanager(cfg, step_id):
             "ifname", "wlan0",
             "con-name", con_name,
             "autoconnect", "yes",
+            "connection.autoconnect-priority", "100",
             "ssid", ssid,
         ],
         step_id,
@@ -466,7 +467,11 @@ def apply_wifi_config_networkmanager(cfg, step_id):
         ],
         step_id,
     )
-    run_cmd(["nmcli", "connection", "up", con_name], step_id)
+    # Deliberately NOT bringing the hotspot up now: that would switch the Pi's
+    # only Wi-Fi radio away from your home network, cutting off this page and
+    # the internet the install still needs (Docker images, packages). The
+    # hotspot starts by itself the next time the Pi boots.
+    log_line(step_id, "Hotspot saved. It will start after the Pi reboots, so this page and the internet keep working during the install.")
 
 
 def apply_wifi_config_dhcpcd(cfg, step_id):
@@ -517,7 +522,6 @@ def apply_wifi_config_dhcpcd(cfg, step_id):
     write_file(hostapd_conf, "\n".join(lines) + "\n", step_id)
     run_cmd(["systemctl", "unmask", "hostapd"], step_id, allow_fail=True)
     run_cmd(["systemctl", "enable", "hostapd"], step_id, allow_fail=True)
-    run_cmd(["systemctl", "restart", "hostapd"], step_id, allow_fail=True)
 
     dhcpcd = Path("/etc/dhcpcd.conf")
     block = f"\ninterface wlan0\n  static ip_address={ip}/24\n  nohook wpa_supplicant\n"
@@ -534,7 +538,7 @@ def apply_wifi_config_dhcpcd(cfg, step_id):
             if not skip:
                 new_lines.append(line)
         write_file(dhcpcd, "\n".join(new_lines) + block, step_id)
-        run_cmd(["systemctl", "restart", "dhcpcd"], step_id, allow_fail=True)
+        log_line(step_id, "Hotspot saved. It will start after the Pi reboots, so this page and the internet keep working during the install.")
     else:
         log_line(step_id, "/etc/dhcpcd.conf not found, skipping static-IP step.", level="error")
 
@@ -3603,7 +3607,20 @@ function showBanner(ok) {
   if (ok) {
     b.innerHTML = 'Setup finished successfully. ' +
       '<a href="/welcome" target="_blank">View the welcome page</a> &middot; ' +
-      '<a href="/welcome.pdf" target="_blank">Download the printable PDF</a>';
+      '<a href="/welcome.pdf" target="_blank">Download the printable PDF</a>' +
+      '<div style="margin-top:10px;font-weight:400">One last step: reboot the Pi to start your Wi-Fi hotspot. ' +
+      'After it restarts, join the Wi-Fi network you chose and open the welcome page there. ' +
+      'This page will stop working when the Pi reboots.</div>' +
+      '<button type="button" id="reboot-btn" style="margin-top:10px;padding:10px 16px;border-radius:999px;border:0;font-weight:700;background:#10b981;color:#052e22;cursor:pointer">Reboot now</button>';
+    const rb = document.getElementById("reboot-btn");
+    rb.onclick = function () {
+      if (!confirm("Reboot the Pi now? This page will disconnect.")) return;
+      rb.disabled = true; rb.textContent = "Rebooting...";
+      fetch("/setup/reboot", {method: "POST"})
+        .then(function (r) { return r.json(); })
+        .then(function (d) { rb.textContent = d.error ? "Could not reboot" : "Rebooting - rejoin the hotspot in about a minute"; })
+        .catch(function () { rb.textContent = "Rebooting - rejoin the hotspot in about a minute"; });
+    };
   } else {
     b.textContent = "Setup stopped due to an error — see the console below. You can go back, change settings and try again.";
   }
@@ -3872,6 +3889,23 @@ def welcome_pdf():
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": f"Couldn't generate the PDF: {e}"}), 500
     return Response(pdf_bytes, mimetype="application/pdf")
+
+
+@app.route("/setup/reboot", methods=["POST"])
+def setup_reboot():
+    """Reboot the Pi (after a successful setup) so the saved hotspot starts."""
+    with STATE_LOCK:
+        allowed = STATE["finished"] and STATE["ok"] and not STATE["running"]
+    if not allowed:
+        return jsonify({"error": "Setup has not finished successfully yet."}), 409
+    try:
+        subprocess.Popen(
+            ["systemd-run", "--on-active=3", "systemctl", "reboot"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError as e:
+        return jsonify({"error": f"Could not start the reboot: {e}"}), 500
+    return jsonify({"ok": True})
 
 
 @app.route("/setup/state", methods=["GET"])
