@@ -18,9 +18,12 @@ import itertools
 import json
 import os
 import platform
+import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -51,6 +54,39 @@ def load_logo_data_uri():
 
 
 LOGO_DATA_URI = load_logo_data_uri()
+
+
+def load_logo_on_dark_data_uri():
+    """The logo file is black artwork on a white background, which turns into
+    a muddy dark blob (with a speckled edge) on the setup/request pages' dark
+    theme. This converts it, once at startup, into light-coloured artwork on
+    a transparent background — cropped tight and scaled down, so it's crisp
+    on dark pages and far smaller to embed than the full-size original. The
+    printable welcome page (white background) keeps using the original.
+    Falls back to the original if Pillow isn't available."""
+    try:
+        from PIL import Image, ImageOps
+
+        ink = ImageOps.invert(Image.open(LOGO_PATH).convert("L"))
+        # Levels: crush the paper's faint speckle to nothing, keep solid ink.
+        ink = ink.point(lambda v: 0 if v < 70 else (255 if v > 170 else int((v - 70) * 255 / 100)))
+        bbox = ink.getbbox()
+        if bbox:
+            pad = 12
+            l, t, r, b = bbox
+            ink = ink.crop((max(0, l - pad), max(0, t - pad), min(ink.width, r + pad), min(ink.height, b + pad)))
+        width = 480
+        ink = ink.resize((width, max(1, round(ink.height * width / ink.width))), Image.LANCZOS)
+        out = Image.new("RGBA", ink.size, (243, 244, 246, 0))
+        out.putalpha(ink)
+        buf = io.BytesIO()
+        out.save(buf, "PNG", optimize=True)
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:  # noqa: BLE001 - purely cosmetic, never block startup
+        return LOGO_DATA_URI
+
+
+LOGO_ON_DARK_DATA_URI = load_logo_on_dark_data_uri()
 
 # A little book emoji, baked into an inline SVG, used only as the browser-tab
 # favicon. The full Lusty Library logo image is the header's main visual on
@@ -140,8 +176,12 @@ DEFAULT_CONFIG = {
         "server_ip": "",
         "server_username": "",
         "server_password": "",
-        "server_path_audio": "/data/media/audiobook",
-        "server_path_books": "/data/media/calibre",
+        # Chosen with the folder browser on the Auto-sync step: the share on the
+        # server, and the folder inside that share, for each of the two folders.
+        "server_share_audio": "",
+        "server_path_audio": "",
+        "server_share_books": "",
+        "server_path_books": "",
     },
     "leds": {
         "enabled": False,
@@ -1035,7 +1075,7 @@ def generate_requests_page_script(cfg):
     media_root = cfg["storage"]["media_root"]
     csv_path = str(Path(media_root) / "requests.csv")
     port = cfg["requests_page"]["port"]
-    logo_data_uri = LOGO_DATA_URI
+    logo_data_uri = LOGO_ON_DARK_DATA_URI
     favicon_data_uri = FAVICON_DATA_URI
 
     return f'''#!/usr/bin/env python3
@@ -1212,17 +1252,236 @@ def detect_ethernet_iface():
     return candidates[0] if candidates else "eth0"
 
 
+# ---------------------------------------------------------------------------
+# SMB folder browsing (the picker on the Auto-sync step)
+#
+# Lists the shares on a server, and the folders inside a share, by running
+# smbclient. Nothing is mounted. Every value that ends up in a smbclient
+# command or in the generated sync script is validated first: smbclient's -c
+# option runs ';'-separated commands, so a quote or ';' in a path must never
+# get through.
+# ---------------------------------------------------------------------------
+
+SMB_TIMEOUT_SECONDS = 25
+SMB_INSTALL_TIMEOUT_SECONDS = 300
+SMB_SKIP_FOLDERS = {"$recycle.bin", "system volume information", "@eadir", "lost+found", "__macosx", "#recycle"}
+_SMB_HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+# Characters that must never reach a smbclient command or the sync script:
+# quotes and ';' (command separators), backslash, wildcards, and control chars.
+_SMB_BAD_CHARS = frozenset('";*?<>|' + chr(92))
+
+
+class _SmbNameBad:
+    @staticmethod
+    def search(text):
+        return any(c in _SMB_BAD_CHARS or ord(c) < 32 for c in text)
+
+
+_SMB_NAME_BAD = _SmbNameBad()
+_SMB_LS_RE = re.compile(
+    r"^\s{2}(?P<name>.+?)\s+(?P<attr>[A-Za-z]+)\s+(?P<size>[0-9]+)\s+"
+    r"[A-Za-z]{3}\s+[A-Za-z]{3}\s+[0-9]+\s+[0-9]{2}:[0-9]{2}:[0-9]{2}\s+[0-9]{4}\s*$"
+)
+_SMBCLIENT_LOCK = threading.Lock()
+
+
+def smb_clean_host(host):
+    host = str(host or "").strip()
+    if not _SMB_HOST_RE.match(host):
+        raise ValueError("Enter the server as an IP address (like 192.168.0.50) or a name (like tower).")
+    return host
+
+
+def smb_clean_share(share):
+    share = str(share or "").strip()
+    if not share:
+        raise ValueError("Choose a share on the server first.")
+    if len(share) > 80 or "/" in share or _SMB_NAME_BAD.search(share) or share.upper() == "IPC$":
+        raise ValueError(f"'{share}' isn't a share name this tool can use.")
+    return share
+
+
+def smb_clean_path(path):
+    """'/media//audiobook/' -> ['media', 'audiobook']. Raises ValueError for
+    anything that could change what a smbclient command does."""
+    parts = []
+    for part in str(path or "").split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise ValueError("A folder path can't contain '..'.")
+        if _SMB_NAME_BAD.search(part):
+            raise ValueError(f"The folder name '{part}' has a character this tool can't handle (a quote, backslash, semicolon or wildcard).")
+        parts.append(part)
+    return parts
+
+
+def _smb_clean_login(value, label):
+    value = str(value or "")
+    if any(c in value for c in "\r\n\x00"):
+        raise ValueError(f"The {label} can't contain line breaks.")
+    return value
+
+
+def ensure_smbclient():
+    """None if smbclient is available (installing it first if it's missing),
+    otherwise a plain-language problem description."""
+    if shutil.which("smbclient"):
+        return None
+    with _SMBCLIENT_LOCK:
+        if shutil.which("smbclient"):
+            return None
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            return "The folder browser needs a small tool (smbclient) that isn't installed, and setup isn't running as root. Run: sudo apt-get install -y smbclient"
+        env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+        last = ""
+        for attempt in range(2):
+            if attempt == 1:  # package lists can be stale on a fresh image
+                subprocess.run(["apt-get", "update"], capture_output=True, text=True, env=env, timeout=SMB_INSTALL_TIMEOUT_SECONDS)
+            try:
+                proc = subprocess.run(
+                    ["apt-get", "install", "-y", "smbclient"],
+                    capture_output=True, text=True, env=env, timeout=SMB_INSTALL_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                return "Installing the folder-browser tool took too long. Check the Pi's internet connection and try again."
+            if proc.returncode == 0 and shutil.which("smbclient"):
+                return None
+            last = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:] or [""]
+            last = last[0]
+        return f"Couldn't install the folder-browser tool (the Pi needs internet for this once). {last}".strip()
+
+
+def start_smbclient_install_async():
+    """Called as soon as auto-sync is ticked, so the tool is usually installed
+    by the time the user taps Browse."""
+    if shutil.which("smbclient"):
+        return
+    threading.Thread(target=ensure_smbclient, daemon=True).start()
+
+
+def run_smbclient(server, username, password, share=None, command=None):
+    """Runs smbclient and returns (returncode, stdout, stderr). Credentials
+    go in a private temp file, never on the command line. Raises
+    subprocess.TimeoutExpired if the server doesn't answer in time."""
+    args = ["smbclient"]
+    args += ["-L", server, "-g"] if share is None else [f"//{server}/{share}"]
+    auth_path = None
+    try:
+        if username:
+            fd, auth_path = tempfile.mkstemp(prefix="lusty-smb-")
+            os.chmod(auth_path, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(f"username = {username}\npassword = {password}\n")
+            args += ["-A", auth_path]
+        else:
+            args += ["-N"]
+        if command:
+            args += ["-c", command]
+        proc = subprocess.run(
+            args, capture_output=True, text=True, timeout=SMB_TIMEOUT_SECONDS,
+            env=dict(os.environ, LC_ALL="C"),
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    finally:
+        if auth_path:
+            try:
+                os.unlink(auth_path)
+            except OSError:
+                pass
+
+
+_SMB_ERRORS = [
+    ("NT_STATUS_LOGON_FAILURE", "The server rejected that username or password."),
+    ("NT_STATUS_WRONG_PASSWORD", "The server rejected that username or password."),
+    ("NT_STATUS_ACCOUNT_DISABLED", "That account is disabled on the server."),
+    ("NT_STATUS_PASSWORD_EXPIRED", "That account's password has expired on the server."),
+    ("NT_STATUS_ACCESS_DENIED", "Access denied. That login isn't allowed to open this (guest access may be turned off — try entering a username and password)."),
+    ("NT_STATUS_BAD_NETWORK_NAME", "The server doesn't have a share with that name."),
+    ("NT_STATUS_OBJECT_NAME_NOT_FOUND", "That folder doesn't exist any more (it may have been renamed)."),
+    ("NT_STATUS_OBJECT_PATH_NOT_FOUND", "That folder doesn't exist any more (it may have been renamed)."),
+    ("NT_STATUS_NO_SUCH_FILE", "That folder doesn't exist any more (it may have been renamed)."),
+    ("NT_STATUS_NOT_A_DIRECTORY", "That isn't a folder."),
+    ("NT_STATUS_HOST_UNREACHABLE", "Couldn't reach the server. Check the IP address and that it's on the same network as this Pi."),
+    ("NT_STATUS_NETWORK_UNREACHABLE", "Couldn't reach the server. Check the IP address and that it's on the same network as this Pi."),
+    ("NT_STATUS_CONNECTION_REFUSED", "The server refused the connection. Is file sharing (SMB) turned on there?"),
+    ("NT_STATUS_IO_TIMEOUT", "The server didn't answer in time. Check the IP address and that it's switched on."),
+    ("NT_STATUS_CONNECTION_DISCONNECTED", "The server dropped the connection. Try again."),
+    ("NT_STATUS_UNSUCCESSFUL", "Couldn't connect to the server. Check the IP address and that file sharing (SMB) is on."),
+    ("NT_STATUS_RESOURCE_NAME_NOT_FOUND", "Couldn't find that server. Check the IP address or name."),
+    ("NT_STATUS_PROTOCOL_NOT_SUPPORTED", "The server and this Pi couldn't agree on an SMB version."),
+]
+
+
+def smb_friendly_error(stdout, stderr):
+    text = f"{stderr}\n{stdout}"
+    for needle, message in _SMB_ERRORS:
+        if needle in text:
+            return message
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return "The server said: " + (lines[-1] if lines else "no details given")
+
+
+def smb_browse(server, username, password, share, parts):
+    """With no share: returns ({'shares': [...]}, None). With a share: returns
+    ({'folders': [...], 'files': n, 'path': '/a/b'}, None). On failure
+    returns (None, plain-language message)."""
+    try:
+        if not share:
+            rc, out, err = run_smbclient(server, username, password)
+            shares = []
+            for line in out.splitlines():
+                kind, _, rest = line.partition("|")
+                name = rest.partition("|")[0]
+                if kind == "Disk" and name and not name.endswith("$"):
+                    shares.append(name)
+            if rc != 0 and not shares:
+                return None, smb_friendly_error(out, err)
+            return {"shares": sorted(set(shares), key=str.lower)}, None
+
+        command = "ls" if not parts else 'ls "' + "/".join(parts) + '/*"'
+        rc, out, err = run_smbclient(server, username, password, share=share, command=command)
+    except subprocess.TimeoutExpired:
+        return None, "The server took too long to answer. Check the IP address and that it's switched on."
+    except OSError as e:
+        return None, f"Couldn't run the folder-browser tool: {e}"
+
+    folders, files = [], 0
+    for line in out.splitlines():
+        m = _SMB_LS_RE.match(line)
+        if not m:
+            continue
+        name, attr = m.group("name"), m.group("attr")
+        if name in (".", ".."):
+            continue
+        if "D" in attr:
+            if name.startswith(".") or name.lower() in SMB_SKIP_FOLDERS:
+                continue
+            folders.append({"name": name, "ok": not _SMB_NAME_BAD.search(name)})
+        else:
+            files += 1
+    if rc != 0 and not folders and not files:
+        return None, smb_friendly_error(out, err)
+    folders.sort(key=lambda f: f["name"].lower())
+    return {"folders": folders, "files": files, "path": "/" + "/".join(parts)}, None
+
+
 def apply_sync_config(cfg, step_id):
     if not cfg["sync"]["enable_sync"]:
         log_line(step_id, "Auto-sync disabled, skipping.")
         return
 
     media_root = cfg["storage"]["media_root"]
-    server_ip = cfg["sync"]["server_ip"]
     username = (cfg["sync"].get("server_username") or "").strip()
     password = cfg["sync"].get("server_password") or ""
-    path_audio = cfg["sync"]["server_path_audio"]
-    path_books = cfg["sync"]["server_path_books"]
+    try:
+        server_ip = smb_clean_host(cfg["sync"]["server_ip"])
+        share_audio = smb_clean_share(cfg["sync"]["server_share_audio"])
+        share_books = smb_clean_share(cfg["sync"]["server_share_books"])
+        path_audio = "/" + "/".join(smb_clean_path(cfg["sync"]["server_path_audio"]))
+        path_books = "/" + "/".join(smb_clean_path(cfg["sync"]["server_path_books"]))
+    except ValueError as e:
+        raise StepFailed(f"Auto-sync settings are incomplete: {e}")
     eth_iface = detect_ethernet_iface()
     log_line(step_id, f"Detected wired interface: {eth_iface}")
 
@@ -1242,18 +1501,23 @@ def apply_sync_config(cfg, step_id):
             SYNC_CREDENTIALS_PATH.unlink()
         cifs_opts = "guest,vers=3.0,iocharset=utf8,noperm,uid=1000,gid=1000"
 
+    q = shlex.quote
+    # Audiobooks and books can live in different shares on the server, so each
+    # gets its own mount. Values are validated above and shell-quoted here.
     script = f"""#!/bin/bash
 set -euo pipefail
 
-SERVER_IP="{server_ip}"
-SERVER_SHARE="//{server_ip}/data"
-MOUNT_POINT="/mnt/remote_data"
+SERVER_IP={q(server_ip)}
+SHARE_AUDIO={q(f"//{server_ip}/{share_audio}")}
+SHARE_BOOKS={q(f"//{server_ip}/{share_books}")}
+MOUNT_AUDIO="/mnt/remote_audio"
+MOUNT_BOOKS="/mnt/remote_books"
 
-SRC_AUDIO="${{MOUNT_POINT}}{path_audio}"
-SRC_BOOKS="${{MOUNT_POINT}}{path_books}"
+SRC_AUDIO="${{MOUNT_AUDIO}}"{q(path_audio)}
+SRC_BOOKS="${{MOUNT_BOOKS}}"{q(path_books)}
 
-DST_AUDIO="{media_root}/audiobooks/"
-DST_BOOKS="{media_root}/books/"
+DST_AUDIO={q(media_root.rstrip("/") + "/audiobooks/")}
+DST_BOOKS={q(media_root.rstrip("/") + "/books/")}
 
 CIFS_OPTS="{cifs_opts}"
 
@@ -1281,28 +1545,40 @@ flock -n 9 || exit 0
     sleep 3
   done
 
-  if ! mountpoint -q "$MOUNT_POINT"; then
-    echo "Mounting $SERVER_SHARE -> $MOUNT_POINT"
-    mkdir -p "$MOUNT_POINT"
-    mount -t cifs "$SERVER_SHARE" "$MOUNT_POINT" -o "$CIFS_OPTS" || {{
-      echo "ERROR: mount failed"
-      rm -f "$FLAG"
-      exit 0
-    }}
+  mount_share() {{
+    local share="$1" point="$2"
+    if ! mountpoint -q "$point"; then
+      echo "Mounting $share -> $point"
+      mkdir -p "$point"
+      mount -t cifs "$share" "$point" -o "$CIFS_OPTS" || return 1
+    fi
+  }}
+
+  unmount_all() {{
+    for point in "$MOUNT_AUDIO" "$MOUNT_BOOKS"; do
+      if mountpoint -q "$point"; then
+        echo "Unmounting $point"
+        umount "$point" || true
+      fi
+    done
+  }}
+
+  if ! mount_share "$SHARE_AUDIO" "$MOUNT_AUDIO" || ! mount_share "$SHARE_BOOKS" "$MOUNT_BOOKS"; then
+    echo "ERROR: mount failed"
+    unmount_all
+    rm -f "$FLAG"
+    exit 0
   fi
 
   mkdir -p "$DST_AUDIO" "$DST_BOOKS"
 
   echo "Syncing audiobooks..."
-  rsync -av --ignore-existing "$SRC_AUDIO" "$DST_AUDIO" || true
+  rsync -av --ignore-existing "${{SRC_AUDIO%/}}/" "$DST_AUDIO" || true
 
   echo "Syncing books..."
-  rsync -av --ignore-existing "$SRC_BOOKS" "$DST_BOOKS" || true
+  rsync -av --ignore-existing "${{SRC_BOOKS%/}}/" "$DST_BOOKS" || true
 
-  if mountpoint -q "$MOUNT_POINT"; then
-    echo "Unmounting $MOUNT_POINT"
-    umount "$MOUNT_POINT" || true
-  fi
+  unmount_all
 
   rm -f "$FLAG"
   echo "==== $(date '+%F %T') — sync done ===="
@@ -2534,25 +2810,105 @@ FORM_TEMPLATE = """
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% if favicon_data_uri %}<link rel="icon" href="{{ favicon_data_uri }}">{% endif %}
   <style>
-    body { font-family: system-ui, sans-serif; background:#111827; color:#f9fafb; margin:0; }
-    .wrap { max-width:900px; margin:4vh auto; padding:0 16px 40px; }
-    .card { background:#1f2937; padding:24px; border-radius:16px; box-shadow:0 10px 40px rgba(0,0,0,.6); margin-bottom:20px; }
-    h1 { margin-top:0; }
-    fieldset { border:1px solid #374151; margin-bottom:18px; border-radius:8px; }
-    legend { padding:0 8px; color:#9ca3af; }
-    label { display:block; margin:8px 0; }
-    input,select { width:100%; padding:8px; border-radius:6px; border:1px solid #4b5563;
-                   background:#030712; color:#e5e7eb; box-sizing:border-box; }
-    .row { display:flex; gap:12px; }
-    .row > div { flex:1; }
-    button { background:#10b981; color:#022c22; border:0; padding:10px 18px; border-radius:999px;
-             font-weight:600; cursor:pointer; margin-top:10px; font-size:15px; }
-    button:hover:not(:disabled) { background:#059669; }
+    :root { --bg:#111827; --card:#1f2937; --line:#374151; --muted:#9ca3af; --accent:#10b981; --accent-dark:#059669; }
+    * { box-sizing:border-box; }
+    [hidden] { display:none !important; }
+    body { font-family: system-ui, sans-serif; background:var(--bg); color:#f9fafb; margin:0; }
+    .wrap { max-width:640px; margin:0 auto; padding:20px 16px 48px; }
+    .card { background:var(--card); padding:22px; border-radius:16px; box-shadow:0 10px 40px rgba(0,0,0,.6); margin-bottom:20px; }
+    h1 { margin:0; font-size:26px; }
+    h2 { margin:0; font-size:20px; }
+    h3 { margin:0; font-size:15px; }
+    label { display:block; margin:12px 0 0; font-size:15px; }
+    input, select { width:100%; padding:12px; margin-top:6px; border-radius:8px; border:1px solid #4b5563;
+                    background:#030712; color:#e5e7eb; font-size:16px; font-family:inherit; }
+    input:focus, select:focus { outline:2px solid var(--accent); outline-offset:1px; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; }
+    .row > div { flex:1 1 150px; min-width:0; }
+    button { background:var(--accent); color:#022c22; border:0; padding:12px 20px; border-radius:999px;
+             font-weight:600; cursor:pointer; font-size:16px; font-family:inherit; }
+    button:hover:not(:disabled) { background:var(--accent-dark); }
     button:disabled { background:#4b5563; color:#9ca3af; cursor:not-allowed; }
-    .checkbox-row { display:flex; align-items:center; gap:8px; }
-    .checkbox-row input { width:auto; }
-    small { color:#9ca3af; }
-    .board-info { color:#9ca3af; font-size:14px; margin-bottom:20px; }
+    button.secondary { background:#374151; color:#f9fafb; }
+    button.secondary:hover:not(:disabled) { background:#4b5563; }
+    small, .hint { color:var(--muted); font-size:13px; line-height:1.45; display:block; margin-top:6px; }
+    code { background:#030712; padding:1px 5px; border-radius:4px; }
+
+    .brand { text-align:center; }
+    .brand img { width:min(180px, 50vw); height:auto; display:block; margin:0 auto 6px; }
+    .board-info { color:var(--muted); font-size:13px; text-align:center; margin:4px 0 0; }
+
+    .progress { display:flex; gap:6px; margin:20px 0 14px; }
+    .seg { flex:1; height:8px; border-radius:99px; background:var(--line); }
+    .seg.done { background:var(--accent); }
+    .seg.current { background:#6ee7b7; }
+    .seg.clickable { cursor:pointer; }
+    .step-count { color:var(--muted); font-size:13px; text-transform:uppercase; letter-spacing:.06em; }
+    .step-title { margin:2px 0 6px; font-size:24px; }
+    .step-intro { color:#d1d5db; font-size:15px; line-height:1.5; margin:0 0 4px; }
+    .step { display:none; }
+    .step.active { display:block; }
+
+    .check { display:flex; align-items:center; gap:12px; padding:14px; margin:12px 0 0; background:#030712;
+             border:1px solid var(--line); border-radius:10px; cursor:pointer; font-size:16px; }
+    .check input { width:22px; height:22px; margin:0; flex-shrink:0; accent-color:var(--accent); }
+    .opt-details { margin-top:4px; padding-left:2px; }
+    .warn-box { background:#450a0a; color:#fecaca; border-radius:8px; padding:12px 14px; margin-top:12px; font-size:14px; line-height:1.45; }
+
+    .step-error { display:none; background:#450a0a; color:#fecaca; border-radius:8px; padding:12px 14px; margin-top:16px; font-size:14px; line-height:1.45; }
+    .step-error.show { display:block; }
+    .nav { display:flex; gap:12px; margin-top:20px; }
+    .nav button { flex:1; padding:14px 18px; }
+
+    .picker-label { margin-top:14px; font-size:15px; }
+    .picker { display:flex; justify-content:space-between; align-items:center; gap:10px; width:100%; margin-top:6px;
+              padding:14px; background:#030712; color:#e5e7eb; border:1px solid #4b5563; border-radius:8px;
+              font-size:16px; font-weight:400; text-align:left; }
+    .picker:hover:not(:disabled) { background:#0b1220; }
+    .picker .picker-text { word-break:break-word; }
+    .picker .picker-text.empty { color:var(--muted); }
+    .picker .picker-go { color:#6ee7b7; font-weight:600; flex-shrink:0; }
+
+    #browse-overlay { position:fixed; inset:0; background:rgba(0,0,0,.7); display:flex; align-items:center;
+                      justify-content:center; padding:12px; z-index:60; }
+    .browse-box { background:var(--card); border-radius:16px; width:100%; max-width:520px; max-height:88vh;
+                  display:flex; flex-direction:column; padding:18px; box-shadow:0 10px 40px rgba(0,0,0,.6); }
+    .br-head { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px; }
+    .br-head h3 { font-size:17px; }
+    .br-head button { padding:6px 12px; font-size:15px; }
+    .br-crumbs { display:flex; flex-wrap:wrap; align-items:center; gap:2px 6px; font-size:14px; margin-bottom:8px; color:var(--muted); }
+    .br-crumbs a { color:#6ee7b7; text-decoration:none; word-break:break-all; }
+    .br-crumbs a:hover { text-decoration:underline; }
+    .br-crumbs .cur { color:#f9fafb; font-weight:600; word-break:break-all; }
+    .br-status { font-size:14px; color:var(--muted); min-height:20px; margin-bottom:6px; line-height:1.45; }
+    .br-status.err { color:#fca5a5; }
+    .br-status button { padding:4px 12px; font-size:13px; margin-left:8px; }
+    .br-list { flex:1 1 auto; min-height:80px; overflow-y:auto; border:1px solid var(--line); border-radius:10px; background:#030712; }
+    .br-list:empty { display:none; }
+    .br-row { display:flex; justify-content:space-between; align-items:center; gap:10px; width:100%; padding:14px; margin:0;
+              background:transparent; color:#e5e7eb; border:0; border-bottom:1px solid var(--line); border-radius:0;
+              font-size:16px; font-weight:400; text-align:left; }
+    .br-row:last-child { border-bottom:0; }
+    .br-row:hover:not(:disabled) { background:#111827; }
+    .br-row:disabled { color:#6b7280; cursor:not-allowed; }
+    .br-row .name { word-break:break-word; }
+    .br-row .go { color:#6ee7b7; flex-shrink:0; }
+    .br-manual { margin-top:10px; }
+    .br-manual .row { align-items:flex-end; }
+    .br-manual button { padding:12px 18px; }
+    .br-foot { display:flex; gap:12px; margin-top:14px; }
+    .br-foot button { flex:1; padding:13px 16px; }
+
+    .rv-group { background:#030712; border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin-top:12px; }
+    .rv-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+    .rv-head a { color:#6ee7b7; font-size:14px; }
+    .rv-row { display:flex; justify-content:space-between; gap:12px; padding:4px 0; font-size:14px; }
+    .rv-row span { color:var(--muted); flex-shrink:0; }
+    .rv-row strong { font-weight:600; text-align:right; word-break:break-word; }
+    .rv-row.warn strong { color:#fca5a5; }
+
+    .progress-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px; }
+    .progress-head button { padding:8px 14px; font-size:14px; }
     #steps { list-style:none; padding:0; margin:0 0 16px; }
     #steps li { display:flex; align-items:center; gap:10px; padding:6px 0; font-size:15px; }
     .badge { display:inline-flex; align-items:center; justify-content:center; width:20px; height:20px;
@@ -2568,239 +2924,664 @@ FORM_TEMPLATE = """
                 white-space:pre-wrap; word-break:break-all; }
     #console .line-error { color:#f87171; }
     #console .line-cmd { color:#93c5fd; }
-    #banner { display:none; padding:12px 16px; border-radius:8px; margin-bottom:16px; font-weight:600; }
+    #banner { display:none; padding:12px 16px; border-radius:8px; margin-bottom:16px; font-weight:600; line-height:1.5; }
     #banner.ok { display:block; background:#064e3b; color:#a7f3d0; }
     #banner.fail { display:block; background:#450a0a; color:#fecaca; }
     #banner a { color:inherit; text-decoration:underline; }
-    .brand { display:flex; align-items:center; gap:14px; }
-    .brand img { height:96px; width:auto; }
-    .brand h1 { margin:0; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="card">
       <div class="brand">
-        {% if logo_data_uri %}<img src="{{ logo_data_uri }}" alt="Lusty Library logo">{% endif %}
-        <h1>Lusty Library Setup</h1>
+        {% if logo_data_uri %}<img src="{{ logo_data_uri }}" alt="Lusty Library"><h1>Setup</h1>{% else %}<h1>Lusty Library Setup</h1>{% endif %}
       </div>
       <div class="board-info">
-        Board: {{ board.model }} &middot; OS: {{ board.os_codename }} &middot; Arch: {{ board.arch }}
+        {{ board.model }} &middot; {{ board.os_codename }} &middot; {{ board.arch }}
       </div>
 
-      <div id="banner"></div>
+      <div id="wizard-body">
+        <div class="progress" id="segs"></div>
+        <div class="step-count" id="step-count"></div>
+        <h2 class="step-title" id="step-title"></h2>
 
-      <form id="setup-form">
-        <fieldset>
-          <legend>Wi-Fi / Hotspot</legend>
-          <div class="row">
-            <div>
-              <label>SSID
-                <input name="wifi_ssid" value="{{ cfg.wifi.ssid }}" placeholder="e.g. LustyLibrary">
+        <form id="setup-form" novalidate>
+
+          <section class="step" data-title="Wi-Fi hotspot">
+            <p class="step-intro">This is the Wi-Fi network patrons join to reach the library. It works with no other internet connection.</p>
+            <label>Network name (SSID)
+              <input name="wifi_ssid" value="{{ cfg.wifi.ssid }}" placeholder="e.g. LustyLibrary" autocomplete="off">
+            </label>
+            <label>Password
+              <input name="wifi_password" value="{{ cfg.wifi.password }}" placeholder="e.g. lustybooks123" autocomplete="off">
+              <small>Must be 8-63 characters &mdash; WPA2 won't accept anything shorter.</small>
+            </label>
+            <label>Hotspot IP address (wlan0)
+              <input name="wifi_ip" value="{{ cfg.wifi.ip }}" placeholder="e.g. 10.10.10.10" inputmode="decimal" autocomplete="off">
+              <small>Uses NetworkManager on newer Raspberry Pi OS, or hostapd/dhcpcd on older images &mdash; picked automatically.</small>
+            </label>
+          </section>
+
+          <section class="step" data-title="Storage">
+            <p class="step-intro">Where the books and audiobooks are kept.</p>
+            <label>Media folder
+              <input name="media_root" value="{{ cfg.storage.media_root }}" placeholder="e.g. /mnt/media" autocomplete="off">
+              <small>Subfolders <code>audiobooks</code>, <code>books</code> and <code>config</code> are created here.</small>
+            </label>
+            <label>USB drive to use (optional)
+              <select name="storage_device">
+                <option value="">Keep existing storage as-is</option>
+                {% for d in devices %}
+                  <option value="{{ d.path }}">{{ d.path }} ({{ d.size }}, {{ d.fstype or 'unformatted' }}, {% if d.mountpoint %}mounted at {{ d.mountpoint }}{% else %}not mounted{% endif %})</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="format_device" name="format_device" data-warn="format-warning">
+              <span>Format the selected drive as ext4 and mount it at the media folder</span>
+            </label>
+            <div class="warn-box" id="format-warning" hidden>&#9888; This erases everything on the selected drive.</div>
+            <small>Already using an attached drive for media? Leave the drive on &ldquo;keep existing&rdquo; and don't tick the format box.</small>
+          </section>
+
+          <section class="step" data-title="Apps">
+            <p class="step-intro">Pick what to install. Docker is installed automatically first if it isn't already there.</p>
+            <label class="check">
+              <input type="checkbox" id="abs" name="install_audiobookshelf" {% if cfg.apps.install_audiobookshelf %}checked{% endif %}>
+              <span>Audiobookshelf <small style="display:inline;">&mdash; audiobooks</small></span>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="cweb" name="install_calibre_web" {% if cfg.apps.install_calibre_web %}checked{% endif %}>
+              <span>Calibre-Web <small style="display:inline;">&mdash; ebooks</small></span>
+            </label>
+            <div class="opt-details" id="patron-details">
+              <div class="row">
+                <div>
+                  <label>Patron username
+                    <input name="patron_username" value="{{ cfg.apps.patron_username }}" autocomplete="off" autocapitalize="none">
+                  </label>
+                </div>
+                <div>
+                  <label>Patron password
+                    <input name="patron_password" value="{{ cfg.apps.patron_password }}" autocomplete="off" autocapitalize="none">
+                  </label>
+                </div>
+              </div>
+              <small>Setup creates this account automatically in whichever app(s) you tick, and shows it on the welcome page. You don't need to log into either app first.</small>
+            </div>
+          </section>
+
+          <section class="step" data-title="Request page">
+            <p class="step-intro">A simple page anyone on the hotspot can use to ask for a book or audiobook. Requests are saved to <code>requests.csv</code> in the media folder, with a one-tap &ldquo;mark fulfilled&rdquo;.</p>
+            <label class="check">
+              <input type="checkbox" id="requests_enabled" name="requests_enabled" data-controls="requests-details" {% if cfg.requests_page.enabled %}checked{% endif %}>
+              <span>Enable the request page</span>
+            </label>
+            <div class="opt-details" id="requests-details">
+              <label>Port
+                <input name="requests_port" value="{{ cfg.requests_page.port }}" inputmode="numeric" autocomplete="off">
               </label>
             </div>
-            <div>
-              <label>Password
-                <input name="wifi_password" value="{{ cfg.wifi.password }}" placeholder="e.g. lustybooks123"
-                       minlength="8" maxlength="63" title="8-63 characters (WPA2 requirement)">
-                <small>Must be 8-63 characters — WPA2 won't accept anything shorter.</small>
-              </label>
-            </div>
-          </div>
-          <label>Hotspot IP (wlan0)
-            <input name="wifi_ip" value="{{ cfg.wifi.ip }}" placeholder="e.g. 10.10.10.10">
-          </label>
-          <small>Automatically uses NetworkManager on newer Raspberry Pi OS, or hostapd/dhcpcd on older images.</small>
-        </fieldset>
+          </section>
 
-        <fieldset>
-          <legend>Storage</legend>
-          <label>Media root path
-            <input name="media_root" value="{{ cfg.storage.media_root }}" placeholder="e.g. /mnt/media">
-          </label>
-          <small>Subfolders like <code>audiobooks</code>, <code>books</code>, <code>config</code> will be created here.</small>
-
-          <label>Detected storage device to use (optional)
-            <select name="storage_device">
-              <option value="">-- Leave existing storage as-is --</option>
-              {% for d in devices %}
-                <option value="{{ d.path }}">{{ d.path }} ({{ d.size }}, {{ d.fstype or 'unformatted' }}, {% if d.mountpoint %}mounted at {{ d.mountpoint }}{% else %}not mounted{% endif %})</option>
-              {% endfor %}
-            </select>
-          </label>
-          <div class="checkbox-row">
-            <input type="checkbox" id="format_device" name="format_device">
-            <label for="format_device">Format selected device as ext4 and mount at {{ cfg.storage.media_root }} <strong>(⚠ erases all data on that device)</strong></label>
-          </div>
-          <small>If you're already using an attached drive for media, leave the device blank and do not check the format box.</small>
-        </fieldset>
-
-        <fieldset>
-          <legend>Apps to install</legend>
-          <div class="checkbox-row">
-            <input type="checkbox" id="abs" name="install_audiobookshelf" {% if cfg.apps.install_audiobookshelf %}checked{% endif %}>
-            <label for="abs">Install Audiobookshelf</label>
-          </div>
-          <div class="checkbox-row">
-            <input type="checkbox" id="cweb" name="install_calibre_web" {% if cfg.apps.install_calibre_web %}checked{% endif %}>
-            <label for="cweb">Install Calibre-Web</label>
-          </div>
-          <small>Docker will be installed automatically first if it isn't already present.</small>
-          <div class="row" style="margin-top:10px;">
-            <div>
-              <label>Patron account username
-                <input name="patron_username" value="{{ cfg.apps.patron_username }}">
-              </label>
-            </div>
-            <div>
-              <label>Patron account password
-                <input name="patron_password" value="{{ cfg.apps.patron_password }}">
-              </label>
-            </div>
-          </div>
-          <small>Setup creates this account automatically in Calibre-Web and/or Audiobookshelf
-          (whichever you install above) and shows it on the welcome page — you don't need to log
-          into either app yourself first.</small>
-        </fieldset>
-
-        <fieldset>
-          <legend>Book/Audiobook Requests</legend>
-          <div class="checkbox-row">
-            <input type="checkbox" id="requests_enabled" name="requests_enabled" {% if cfg.requests_page.enabled %}checked{% endif %}>
-            <label for="requests_enabled">Enable a request page for patrons</label>
-          </div>
-          <label>Port
-            <input name="requests_port" value="{{ cfg.requests_page.port }}">
-          </label>
-          <small>A simple page anyone on the hotspot can use to ask for a title. Requests are saved to
-          <code>requests.csv</code> in the media folder and shown in a table on the same page, with a
-          one-click "mark fulfilled" toggle.</small>
-        </fieldset>
-
-        <fieldset>
-          <legend>Welcome / Instructions Page</legend>
-          <small>After setup finishes, a printable welcome page is generated at
-          <code>/welcome</code> (and as a PDF at <code>/welcome.pdf</code>) with the Lusty Library
-          logo, Wi-Fi info, the patron account above, and QR codes for eBooks, Audiobooks, and
-          requests — only for the features you actually installed above.</small>
-        </fieldset>
-
-        <fieldset>
-          <legend>Auto-sync from Server (optional)</legend>
-          <div class="checkbox-row">
-            <input type="checkbox" id="enable_sync" name="enable_sync" {% if cfg.sync.enable_sync %}checked{% endif %}>
-            <label for="enable_sync">Enable auto-sync from server when Ethernet is plugged in</label>
-          </div>
-          <div class="row">
-            <div>
+          <section class="step" data-title="Auto-sync (optional)">
+            <p class="step-intro">Copy audiobooks and books from another computer or NAS on your network, automatically, the moment an Ethernet cable is plugged in. Skip this if you don't need it.</p>
+            <label class="check">
+              <input type="checkbox" id="enable_sync" name="enable_sync" data-controls="sync-details" {% if cfg.sync.enable_sync %}checked{% endif %}>
+              <span>Enable auto-sync from a server</span>
+            </label>
+            <div class="opt-details" id="sync-details">
               <label>Server IP
-                <input name="server_ip" value="{{ cfg.sync.server_ip }}" placeholder="e.g. 192.168.0.139">
+                <input name="server_ip" value="{{ cfg.sync.server_ip }}" placeholder="e.g. 192.168.0.139" inputmode="decimal" autocomplete="off">
               </label>
-            </div>
-          </div>
-          <div class="row">
-            <div>
-              <label>Username <small>(leave blank for guest access)</small>
-                <input name="server_username" value="{{ cfg.sync.server_username }}" placeholder="e.g. ryan">
-              </label>
-            </div>
-            <div>
-              <label>Password
-                <input type="password" name="server_password" value="{{ cfg.sync.server_password }}" placeholder="leave blank if guest">
-              </label>
-            </div>
-          </div>
-          <label>Audiobooks path on server
-            <input name="server_path_audio" value="{{ cfg.sync.server_path_audio }}" placeholder="e.g. /data/media/audiobook">
-          </label>
-          <label>Books/Calibre path on server
-            <input name="server_path_books" value="{{ cfg.sync.server_path_books }}" placeholder="e.g. /data/media/calibre">
-          </label>
-          <small>These are the paths as they exist on the remote server share (for example <code>/data/media/audiobook</code>). Sync runs automatically the moment an Ethernet cable is plugged in — no polling.</small>
-        </fieldset>
+              <div class="row">
+                <div>
+                  <label>Username <small style="display:inline;">(blank = guest)</small>
+                    <input name="server_username" value="{{ cfg.sync.server_username }}" placeholder="e.g. ryan" autocomplete="off" autocapitalize="none">
+                  </label>
+                </div>
+                <div>
+                  <label>Password
+                    <input type="password" name="server_password" value="{{ cfg.sync.server_password }}" placeholder="blank if guest" autocomplete="off">
+                  </label>
+                </div>
+              </div>
+              <div class="picker-label">Audiobooks folder on the server</div>
+              <button type="button" class="picker" id="pick-audio" data-kind="audio"><span class="picker-text"></span><span class="picker-go">Browse</span></button>
+              <input type="hidden" name="server_share_audio" value="{{ cfg.sync.server_share_audio }}">
+              <input type="hidden" name="server_path_audio" value="{{ cfg.sync.server_path_audio }}">
 
-        <fieldset>
-          <legend>Status LEDs (optional)</legend>
-          <div class="checkbox-row">
-            <input type="checkbox" id="leds_enabled" name="leds_enabled" {% if cfg.leds.enabled %}checked{% endif %}>
-            <label for="leds_enabled">I have status LEDs wired up (Wi-Fi / Calibre-Web / Audiobookshelf)</label>
-          </div>
-          <div class="row">
-            <div>
-              <label>Wi-Fi LED (BCM pin)
-                <input name="pin_wifi" value="{{ cfg.leds.pin_wifi }}">
-              </label>
+              <div class="picker-label">Books (Calibre) folder on the server</div>
+              <button type="button" class="picker" id="pick-books" data-kind="books"><span class="picker-text"></span><span class="picker-go">Browse</span></button>
+              <input type="hidden" name="server_share_books" value="{{ cfg.sync.server_share_books }}">
+              <input type="hidden" name="server_path_books" value="{{ cfg.sync.server_path_books }}">
+              <small>Tap Browse to look through the server and pick each folder. Nothing is copied until a cable is plugged in.</small>
             </div>
-            <div>
-              <label>Calibre-Web LED (BCM pin)
-                <input name="pin_cweb" value="{{ cfg.leds.pin_cweb }}">
-              </label>
-            </div>
-            <div>
-              <label>Audiobookshelf LED (BCM pin)
-                <input name="pin_abs" value="{{ cfg.leds.pin_abs }}">
-              </label>
-            </div>
-          </div>
-          <small>Each LED is tested (blink + confirm) right after the feature it indicates is installed, plus a
-          full test screen up front. The status service is installed last so it doesn't fight the test.</small>
-        </fieldset>
+          </section>
 
-        <fieldset>
-          <legend>Shutdown button (optional)</legend>
-          <div class="checkbox-row">
-            <input type="checkbox" id="shutdown_enabled" name="shutdown_enabled" {% if cfg.shutdown_button.enabled %}checked{% endif %}>
-            <label for="shutdown_enabled">I have a shutdown button wired up</label>
-          </div>
-          <div class="row">
-            <div>
-              <label>Button (BCM pin)
-                <input name="shutdown_pin" value="{{ cfg.shutdown_button.pin }}">
-              </label>
-            </div>
-            <div>
-              <label>Hold time to trigger (seconds)
-                <input name="shutdown_hold_secs" value="{{ cfg.shutdown_button.hold_secs }}">
-              </label>
-            </div>
-          </div>
-          <small>Setup will ask you to press and hold the button for real (GPIO is checked directly, not just
-          asked about) before installing the always-on watcher service.</small>
-        </fieldset>
+          <section class="step" data-title="Hardware (optional)">
+            <p class="step-intro">Only tick these if you've actually wired them to the Pi's GPIO pins. Each one is tested for real during setup.</p>
 
-        <button type="submit" id="apply-btn">Apply &amp; Set Up</button>
-      </form>
+            <label class="check">
+              <input type="checkbox" id="leds_enabled" name="leds_enabled" data-controls="leds-details" {% if cfg.leds.enabled %}checked{% endif %}>
+              <span>Status LEDs (Wi-Fi / Calibre-Web / Audiobookshelf)</span>
+            </label>
+            <div class="opt-details" id="leds-details">
+              <div class="row">
+                <div>
+                  <label>Wi-Fi LED pin
+                    <input name="pin_wifi" value="{{ cfg.leds.pin_wifi }}" inputmode="numeric" autocomplete="off">
+                  </label>
+                </div>
+                <div>
+                  <label>Calibre-Web LED pin
+                    <input name="pin_cweb" value="{{ cfg.leds.pin_cweb }}" inputmode="numeric" autocomplete="off">
+                  </label>
+                </div>
+                <div>
+                  <label>Audiobookshelf LED pin
+                    <input name="pin_abs" value="{{ cfg.leds.pin_abs }}" inputmode="numeric" autocomplete="off">
+                  </label>
+                </div>
+              </div>
+              <small>BCM (GPIO) numbers. Each LED is held on so you can confirm it really lights up.</small>
+            </div>
+
+            <label class="check">
+              <input type="checkbox" id="shutdown_enabled" name="shutdown_enabled" data-controls="shutdown-details" {% if cfg.shutdown_button.enabled %}checked{% endif %}>
+              <span>Shutdown button (press and hold)</span>
+            </label>
+            <div class="opt-details" id="shutdown-details">
+              <div class="row">
+                <div>
+                  <label>Button pin
+                    <input name="shutdown_pin" value="{{ cfg.shutdown_button.pin }}" inputmode="numeric" autocomplete="off">
+                  </label>
+                </div>
+                <div>
+                  <label>Hold time (seconds)
+                    <input name="shutdown_hold_secs" value="{{ cfg.shutdown_button.hold_secs }}" inputmode="decimal" autocomplete="off">
+                  </label>
+                </div>
+              </div>
+              <small>Setup will ask you to press and hold the button for real before installing the always-on watcher.</small>
+            </div>
+          </section>
+
+          <section class="step" data-title="Review &amp; install">
+            <p class="step-intro">Check everything, then start. Tap <em>Edit</em> on any section to change it.</p>
+            <div id="review"></div>
+            <small>When setup finishes, a printable welcome page (also as a PDF) is generated with the logo, Wi-Fi info, the patron account and QR codes for what you installed.</small>
+          </section>
+
+          <div class="step-error" id="step-error" role="alert"></div>
+
+          <div class="nav">
+            <button type="button" class="secondary" id="back-btn">Back</button>
+            <button type="button" id="next-btn">Next</button>
+            <button type="submit" id="apply-btn" hidden>Apply &amp; Set Up</button>
+          </div>
+        </form>
+      </div>
     </div>
 
-    <div class="card">
-      <h2 style="margin-top:0;">Progress</h2>
+    <div class="card" id="progress-card" hidden>
+      <div class="progress-head">
+        <h2>Progress</h2>
+        <button type="button" class="secondary" id="edit-settings" hidden>&larr; Change settings</button>
+      </div>
+      <div id="banner"></div>
       <ul id="steps">
         {% for id, label in step_order %}
-          <li data-step="{{ id }}"><span class="badge pending">•</span><span class="label">{{ label }}</span></li>
+          <li data-step="{{ id }}"><span class="badge pending">&bull;</span><span class="label">{{ label }}</span></li>
         {% endfor %}
       </ul>
       <div id="console"></div>
     </div>
   </div>
 
+  <div id="browse-overlay" hidden>
+    <div class="browse-box" role="dialog" aria-modal="true" aria-labelledby="br-title">
+      <div class="br-head">
+        <h3 id="br-title">Choose a folder</h3>
+        <button type="button" class="secondary" id="br-close" aria-label="Close">&#10005;</button>
+      </div>
+      <div class="br-crumbs" id="br-crumbs"></div>
+      <div class="br-status" id="br-status"></div>
+      <div class="br-list" id="br-list"></div>
+      <div class="br-manual" id="br-manual" hidden>
+        <small style="margin-top:0;">Don't see your share? Type its name:</small>
+        <div class="row">
+          <div><input id="br-share-input" placeholder="e.g. media" autocomplete="off" autocapitalize="none" style="margin-top:6px;"></div>
+          <div style="flex:0 0 auto;"><button type="button" class="secondary" id="br-share-go">Open</button></div>
+        </div>
+      </div>
+      <div class="br-foot">
+        <button type="button" class="secondary" id="br-cancel">Cancel</button>
+        <button type="button" id="br-use" disabled>Use this folder</button>
+      </div>
+    </div>
+  </div>
+
   <div id="confirm-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6);
-       align-items:center; justify-content:center; z-index:50;">
+       align-items:center; justify-content:center; z-index:50; padding:16px;">
     <div style="background:#1f2937; padding:24px; border-radius:16px; max-width:420px; text-align:center;">
       <p id="confirm-question" style="font-size:16px; margin-bottom:18px;"></p>
       <div style="display:flex; gap:12px; justify-content:center;">
         <button id="confirm-yes" type="button">Yes</button>
-        <button id="confirm-no" type="button" style="background:#4b5563; color:#f9fafb;">No / skip</button>
+        <button id="confirm-no" type="button" class="secondary">No / skip</button>
       </div>
     </div>
   </div>
 
 <script>
 const STEP_LABELS = {{ step_order_json|safe }};
+{% raw %}
 const badgeChar = {pending:"•", running:"…", done:"✓", error:"✕", skipped:"–"};
-let es = null;
+
+const form = document.getElementById("setup-form");
+const steps = Array.from(document.querySelectorAll(".step"));
+const segsEl = document.getElementById("segs");
+const backBtn = document.getElementById("back-btn");
+const nextBtn = document.getElementById("next-btn");
+const applyBtn = document.getElementById("apply-btn");
+const errEl = document.getElementById("step-error");
+const wizardBody = document.getElementById("wizard-body");
+const progressCard = document.getElementById("progress-card");
+const editBtn = document.getElementById("edit-settings");
+let current = 0, maxVisited = 0, es = null;
+
+const val = (n) => { const el = form.elements[n]; return el ? String(el.value).trim() : ""; };
+const on = (n) => { const el = form.elements[n]; return !!(el && el.checked); };
+const isIPv4 = (s) => /^[0-9]{1,3}([.][0-9]{1,3}){3}$/.test(s) && s.split(".").every(p => Number(p) <= 255);
+const isPin = (s) => /^[0-9]{1,2}$/.test(s) && Number(s) >= 2 && Number(s) <= 27;
+
+// ---- per-step validation (index matches the order of the <section class="step"> blocks) ----
+const validators = [
+  () => {  // Wi-Fi
+    const ssidBytes = new TextEncoder().encode(val("wifi_ssid")).length;
+    const pw = val("wifi_password");
+    if (ssidBytes < 1 || ssidBytes > 32) return "The Wi-Fi network name must be 1-32 characters.";
+    if (pw.length < 8 || pw.length > 63) return "The Wi-Fi password must be 8-63 characters (WPA2 won't accept anything shorter). Yours is " + pw.length + ".";
+    if (!isIPv4(val("wifi_ip"))) return "Enter the hotspot IP like 10.10.10.10.";
+    return "";
+  },
+  () => {  // Storage
+    if (!val("media_root").startsWith("/")) return "The media folder must be a full path starting with /, like /mnt/media.";
+    if (on("format_device") && !val("storage_device")) return "You ticked format, but no USB drive is selected. Pick a drive, or untick the format box.";
+    return "";
+  },
+  () => {  // Apps
+    if ((on("install_audiobookshelf") || on("install_calibre_web")) && (!val("patron_username") || !val("patron_password"))) {
+      return "Enter a patron username and password.";
+    }
+    return "";
+  },
+  () => {  // Request page
+    if (on("requests_enabled")) {
+      const p = Number(val("requests_port"));
+      if (!(Number.isInteger(p) && p >= 1 && p <= 65535)) return "The request page port must be a number between 1 and 65535.";
+    }
+    return "";
+  },
+  () => {  // Auto-sync
+    if (on("enable_sync")) {
+      if (!val("server_ip")) return "Enter the server's IP address, or untick auto-sync.";
+      if (!val("server_share_audio") || !val("server_share_books")) {
+        return "Tap Browse to pick the audiobooks folder and the books folder on the server, or untick auto-sync.";
+      }
+    }
+    return "";
+  },
+  () => {  // Hardware
+    const used = [];
+    if (on("leds_enabled")) {
+      for (const [n, label] of [["pin_wifi", "Wi-Fi LED"], ["pin_cweb", "Calibre-Web LED"], ["pin_abs", "Audiobookshelf LED"]]) {
+        if (!isPin(val(n))) return "The " + label + " pin must be a GPIO number from 2 to 27.";
+        used.push([val(n), label]);
+      }
+    }
+    if (on("shutdown_enabled")) {
+      if (!isPin(val("shutdown_pin"))) return "The shutdown button pin must be a GPIO number from 2 to 27.";
+      const secs = Number(val("shutdown_hold_secs"));
+      if (!(secs > 0 && secs <= 30)) return "The hold time must be more than 0 and at most 30 seconds.";
+      used.push([val("shutdown_pin"), "shutdown button"]);
+    }
+    const seen = {};
+    for (const [pin, label] of used) {
+      if (seen[pin]) return "GPIO" + pin + " is chosen for both the " + seen[pin] + " and the " + label + ".";
+      seen[pin] = label;
+    }
+    return "";
+  },
+  () => "",  // Review
+];
+
+// ---- wizard navigation ----
+steps.forEach((s, i) => {
+  const seg = document.createElement("span");
+  seg.className = "seg";
+  seg.setAttribute("role", "button");
+  seg.setAttribute("tabindex", "0");
+  seg.setAttribute("aria-label", "Step " + (i + 1) + ": " + s.dataset.title);
+  seg.title = s.dataset.title;
+  const go = () => { if (i <= maxVisited) jumpTo(i); };
+  seg.addEventListener("click", go);
+  seg.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+  segsEl.appendChild(seg);
+});
+
+function showErr(msg) { errEl.textContent = msg; errEl.classList.add("show"); }
+function clearErr() { errEl.textContent = ""; errEl.classList.remove("show"); }
+
+function show(i, scroll = true) {
+  current = i;
+  maxVisited = Math.max(maxVisited, i);
+  steps.forEach((s, idx) => s.classList.toggle("active", idx === i));
+  Array.from(segsEl.children).forEach((seg, idx) => {
+    seg.className = "seg" + (idx < i ? " done" : idx === i ? " current" : "") + (idx <= maxVisited ? " clickable" : "");
+  });
+  document.getElementById("step-count").textContent = "Step " + (i + 1) + " of " + steps.length;
+  document.getElementById("step-title").textContent = steps[i].dataset.title;
+  const last = i === steps.length - 1;
+  backBtn.hidden = i === 0;
+  nextBtn.hidden = last;
+  applyBtn.hidden = !last;
+  if (last) renderReview();
+  clearErr();
+  // Bring the step into view (skipping past the logo) so each Next lands on its content.
+  if (scroll) segsEl.scrollIntoView({behavior: "smooth", block: "start"});
+}
+
+function goNext() {
+  const err = validators[current]();
+  if (err) { showErr(err); return; }
+  show(current + 1);
+}
+
+function jumpTo(i) {
+  if (i === current) return;
+  if (i > current) {
+    for (let k = current; k < i; k++) {
+      const err = validators[k]();
+      if (err) { show(k); showErr(err); return; }
+    }
+  }
+  show(i);
+}
+
+backBtn.addEventListener("click", () => { if (current > 0) show(current - 1); });
+nextBtn.addEventListener("click", goNext);
+// Enter in a field means "next", never "submit the whole form from step 1".
+form.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && e.target.tagName === "INPUT" && e.target.type !== "checkbox") {
+    e.preventDefault();
+    if (current < steps.length - 1) goNext();
+  }
+});
+
+// ---- show/hide dependent fields ----
+function syncToggles() {
+  document.querySelectorAll("[data-controls]").forEach((cb) => {
+    document.getElementById(cb.dataset.controls).hidden = !cb.checked;
+  });
+  document.getElementById("patron-details").hidden = !(on("install_audiobookshelf") || on("install_calibre_web"));
+  document.getElementById("format-warning").hidden = !on("format_device");
+}
+form.addEventListener("change", syncToggles);
+syncToggles();
+
+// ---- server folder picker (Auto-sync step) ----
+const BR_TITLES = {audio: "Choose the audiobooks folder", books: "Choose the books folder"};
+let br = null;
+let prepared = false;
+
+function formatLoc(share, path) {
+  if (!share) return "—";
+  return [share].concat(String(path || "").split("/").filter(Boolean)).join(" › ");
+}
+
+function renderPickers() {
+  for (const kind of ["audio", "books"]) {
+    const share = val("server_share_" + kind);
+    const el = document.querySelector("#pick-" + kind + " .picker-text");
+    el.textContent = share ? formatLoc(share, val("server_path_" + kind)) : "Choose a folder…";
+    el.classList.toggle("empty", !share);
+  }
+}
+
+const brEl = (id) => document.getElementById(id);
+
+function closeBrowser() {
+  if (br) br.token++;
+  br = null;
+  brEl("browse-overlay").hidden = true;
+}
+
+function openBrowser(kind) {
+  const server = val("server_ip");
+  if (!/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(server)) {
+    showErr("Enter the server's IP address first, then tap Browse.");
+    return;
+  }
+  clearErr();
+  br = {kind: kind, share: val("server_share_" + kind), parts: String(val("server_path_" + kind)).split("/").filter(Boolean), token: 0};
+  brEl("br-title").textContent = BR_TITLES[kind];
+  brEl("browse-overlay").hidden = false;
+  loadBrowser();
+}
+
+function brStatus(text, isErr, retry) {
+  const s = brEl("br-status");
+  s.textContent = text;
+  s.classList.toggle("err", !!isErr);
+  if (retry) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "secondary";
+    b.textContent = "Try again";
+    b.addEventListener("click", loadBrowser);
+    s.appendChild(b);
+  }
+}
+
+function brCrumbs() {
+  const box = brEl("br-crumbs");
+  box.textContent = "";
+  const add = (label, onClick, current) => {
+    if (box.childNodes.length) { const sep = document.createElement("span"); sep.textContent = "›"; box.appendChild(sep); }
+    if (current) {
+      const c = document.createElement("span"); c.className = "cur"; c.textContent = label; box.appendChild(c);
+    } else {
+      const a = document.createElement("a"); a.href = "#"; a.textContent = label;
+      a.addEventListener("click", (e) => { e.preventDefault(); onClick(); });
+      box.appendChild(a);
+    }
+  };
+  add(val("server_ip"), () => { br.share = ""; br.parts = []; loadBrowser(); }, !br.share);
+  if (br.share) {
+    add(br.share, () => { br.parts = []; loadBrowser(); }, br.parts.length === 0);
+    br.parts.forEach((name, i) => {
+      add(name, () => { br.parts = br.parts.slice(0, i + 1); loadBrowser(); }, i === br.parts.length - 1);
+    });
+  }
+}
+
+async function loadBrowser() {
+  const my = ++br.token;
+  brCrumbs();
+  brEl("br-list").textContent = "";
+  brEl("br-manual").hidden = true;
+  brEl("br-use").disabled = true;
+  brEl("br-use").textContent = br.share && br.parts.length === 0 ? "Use whole share" : "Use this folder";
+  brStatus("Connecting to the server…");
+  const slow = setTimeout(() => {
+    if (br && br.token === my) brStatus("Still working… the first time, a small tool is installed on the Pi, which can take a minute.");
+  }, 4000);
+  try {
+    const resp = await fetch("/setup/browse", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        server: val("server_ip"), username: val("server_username"), password: form.elements["server_password"].value,
+        share: br.share, path: "/" + br.parts.join("/"),
+      }),
+    });
+    const data = await resp.json().catch(() => ({error: "Unexpected reply from the Pi."}));
+    clearTimeout(slow);
+    if (!br || br.token !== my) return;
+    if (!resp.ok) {
+      brStatus(data.error || "Something went wrong.", true, true);
+      brEl("br-manual").hidden = !!br.share;   // can't list shares? let them type one
+      return;
+    }
+    renderBrowser(data);
+  } catch (e) {
+    clearTimeout(slow);
+    if (br && br.token === my) brStatus("Couldn't reach the setup service on the Pi.", true, true);
+  }
+}
+
+function renderBrowser(data) {
+  const list = brEl("br-list");
+  list.textContent = "";
+  const row = (label, enabled, onClick) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "br-row";
+    b.disabled = !enabled;
+    const n = document.createElement("span"); n.className = "name"; n.textContent = label;
+    const g = document.createElement("span"); g.className = "go"; g.textContent = enabled ? "›" : "";
+    b.append(n, g);
+    if (enabled) b.addEventListener("click", onClick);
+    list.appendChild(b);
+  };
+  if (!br.share) {
+    brEl("br-manual").hidden = false;
+    brEl("br-share-input").value = "";
+    if (data.shares.length === 0) brStatus("No shares were listed. If you know the share's name, type it below.");
+    else brStatus("Shares on this server — tap one to look inside:");
+    data.shares.forEach((s) => row(s, true, () => { br.share = s; br.parts = []; loadBrowser(); }));
+    return;
+  }
+  brEl("br-use").disabled = false;
+  data.folders.forEach((f) => row(f.ok ? f.name : f.name + "  (name not supported)", f.ok, () => { br.parts.push(f.name); loadBrowser(); }));
+  const files = data.files === 1 ? "1 file" : data.files + " files";
+  const folders = data.folders.length === 0 ? "no folders" : (data.folders.length === 1 ? "1 folder" : data.folders.length + " folders");
+  brStatus("Here: " + files + ", " + folders + ".");
+}
+
+function useBrowserFolder() {
+  if (!br || !br.share) return;
+  form.elements["server_share_" + br.kind].value = br.share;
+  form.elements["server_path_" + br.kind].value = "/" + br.parts.join("/");
+  renderPickers();
+  closeBrowser();
+}
+
+document.getElementById("pick-audio").addEventListener("click", () => openBrowser("audio"));
+document.getElementById("pick-books").addEventListener("click", () => openBrowser("books"));
+brEl("br-close").addEventListener("click", closeBrowser);
+brEl("br-cancel").addEventListener("click", closeBrowser);
+brEl("br-use").addEventListener("click", useBrowserFolder);
+brEl("br-share-go").addEventListener("click", () => {
+  const name = brEl("br-share-input").value.trim();
+  if (name && br) { br.share = name; br.parts = []; loadBrowser(); }
+});
+brEl("br-share-input").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); brEl("br-share-go").click(); } });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && br) closeBrowser(); });
+// A different server means the earlier folder choices no longer apply.
+form.elements["server_ip"].addEventListener("change", () => {
+  for (const kind of ["audio", "books"]) {
+    form.elements["server_share_" + kind].value = "";
+    form.elements["server_path_" + kind].value = "";
+  }
+  renderPickers();
+});
+// Start installing the browsing tool in the background as soon as sync is switched on.
+form.elements["enable_sync"].addEventListener("change", () => {
+  if (on("enable_sync") && !prepared) {
+    prepared = true;
+    fetch("/setup/browse/prepare", {method: "POST"}).catch(() => {});
+  }
+});
+renderPickers();
+
+// ---- review screen ----
+function renderReview() {
+  const dev = form.elements["storage_device"];
+  const devText = dev.value ? dev.options[dev.selectedIndex].text : "Keep existing storage as-is";
+  const yn = (b) => b ? "Yes" : "No";
+  const groups = [];
+
+  groups.push({title: "Wi-Fi hotspot", step: 0, rows: [
+    ["Network name", val("wifi_ssid")], ["Password", val("wifi_password")], ["Hotspot IP", val("wifi_ip")]]});
+
+  const storage = [["Media folder", val("media_root")], ["USB drive", devText]];
+  if (on("format_device") && dev.value) storage.push(["Format", "ERASES " + dev.value, "warn"]);
+  groups.push({title: "Storage", step: 1, rows: storage});
+
+  const apps = [["Audiobookshelf", yn(on("install_audiobookshelf"))], ["Calibre-Web", yn(on("install_calibre_web"))]];
+  if (on("install_audiobookshelf") || on("install_calibre_web")) {
+    apps.push(["Patron login", val("patron_username") + " / " + val("patron_password")]);
+  }
+  groups.push({title: "Apps", step: 2, rows: apps});
+
+  groups.push({title: "Request page", step: 3, rows: on("requests_enabled")
+    ? [["Enabled", "Yes, port " + val("requests_port")]] : [["Enabled", "No"]]});
+
+  groups.push({title: "Auto-sync", step: 4, rows: on("enable_sync") ? [
+    ["Server", val("server_ip")],
+    ["Login", val("server_username") ? val("server_username") + " / ••••" : "Guest"],
+    ["Audiobooks", formatLoc(val("server_share_audio"), val("server_path_audio"))],
+    ["Books", formatLoc(val("server_share_books"), val("server_path_books"))]] : [["Enabled", "No"]]});
+
+  const hw = [];
+  hw.push(["Status LEDs", on("leds_enabled")
+    ? "GPIO " + val("pin_wifi") + " / " + val("pin_cweb") + " / " + val("pin_abs") : "No"]);
+  hw.push(["Shutdown button", on("shutdown_enabled")
+    ? "GPIO " + val("shutdown_pin") + ", hold " + val("shutdown_hold_secs") + "s" : "No"]);
+  groups.push({title: "Hardware", step: 5, rows: hw});
+
+  const review = document.getElementById("review");
+  review.textContent = "";
+  for (const g of groups) {
+    const box = document.createElement("div");
+    box.className = "rv-group";
+    const head = document.createElement("div");
+    head.className = "rv-head";
+    const h = document.createElement("h3");
+    h.textContent = g.title;
+    const a = document.createElement("a");
+    a.href = "#";
+    a.textContent = "Edit";
+    a.addEventListener("click", (e) => { e.preventDefault(); jumpTo(g.step); });
+    head.append(h, a);
+    box.append(head);
+    for (const [k, v, cls] of g.rows) {
+      const row = document.createElement("div");
+      row.className = "rv-row" + (cls ? " " + cls : "");
+      const kk = document.createElement("span");
+      kk.textContent = k;
+      const vv = document.createElement("strong");
+      vv.textContent = v === "" ? "—" : v;
+      row.append(kk, vv);
+      box.append(row);
+    }
+    review.append(box);
+  }
+}
+
+// ---- progress / live console ----
+function showMode(mode) {
+  const progress = mode === "progress";
+  wizardBody.hidden = progress;
+  progressCard.hidden = !progress;
+  if (progress) progressCard.scrollIntoView({behavior: "smooth", block: "start"});
+}
 
 function setBadge(stepId, status) {
-  const li = document.querySelector(`li[data-step="${stepId}"]`);
+  const li = document.querySelector('li[data-step="' + stepId + '"]');
   if (!li) return;
   const badge = li.querySelector(".badge");
   badge.className = "badge " + status;
@@ -2824,7 +3605,7 @@ function showBanner(ok) {
       '<a href="/welcome" target="_blank">View the welcome page</a> &middot; ' +
       '<a href="/welcome.pdf" target="_blank">Download the printable PDF</a>';
   } else {
-    b.textContent = "Setup stopped due to an error — see the console below.";
+    b.textContent = "Setup stopped due to an error — see the console below. You can go back, change settings and try again.";
   }
 }
 
@@ -2834,12 +3615,12 @@ function showConfirm(data) {
   document.getElementById("confirm-no").textContent = data.no_label || "No / skip";
   document.getElementById("confirm-overlay").style.display = "flex";
 
-  const answer = (val) => {
+  const answer = (v) => {
     document.getElementById("confirm-overlay").style.display = "none";
     fetch("/setup/confirm", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({confirm_id: data.confirm_id, answer: val}),
+      body: JSON.stringify({confirm_id: data.confirm_id, answer: v}),
     });
   };
   document.getElementById("confirm-yes").onclick = () => answer(true);
@@ -2860,27 +3641,35 @@ function connectStream() {
     } else if (data.kind === "confirm_request") {
       showConfirm(data);
     } else if (data.kind === "done") {
-      document.getElementById("apply-btn").disabled = false;
-      document.getElementById("apply-btn").textContent = "Apply & Set Up";
+      applyBtn.disabled = false;
+      applyBtn.textContent = "Apply & Set Up";
+      editBtn.hidden = false;
       document.getElementById("confirm-overlay").style.display = "none";
       showBanner(data.ok);
     } else if (data.kind === "start") {
       document.getElementById("console").innerHTML = "";
-      document.getElementById("banner").style.display = "none";
+      document.getElementById("banner").className = "";
       document.getElementById("confirm-overlay").style.display = "none";
+      editBtn.hidden = true;
+      showMode("progress");
     }
   };
 }
 
-document.getElementById("setup-form").addEventListener("submit", async (e) => {
+editBtn.addEventListener("click", () => { showMode("edit"); show(steps.length - 1); });
+
+form.addEventListener("submit", async (e) => {
   e.preventDefault();
-  const btn = document.getElementById("apply-btn");
-  btn.disabled = true;
-  btn.textContent = "Running...";
-  document.getElementById("banner").style.display = "none";
+  for (let i = 0; i < validators.length; i++) {
+    const err = validators[i]();
+    if (err) { show(i); showErr(err); return; }
+  }
+  applyBtn.disabled = true;
+  applyBtn.textContent = "Running...";
+  document.getElementById("banner").className = "";
   Object.keys(STEP_LABELS).forEach(id => setBadge(id, "pending"));
 
-  const fd = new FormData(e.target);
+  const fd = new FormData(form);
   const payload = {};
   for (const [k, v] of fd.entries()) payload[k] = v;
   payload.format_device = fd.has("format_device");
@@ -2902,24 +3691,33 @@ document.getElementById("setup-form").addEventListener("submit", async (e) => {
   });
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({error: resp.statusText}));
-    appendLine("Failed to start: " + (err.error || resp.statusText), "line-error");
-    btn.disabled = false;
-    btn.textContent = "Apply & Set Up";
+    const msg = err.error || resp.statusText;
+    if (es) es.close();
+    applyBtn.disabled = false;
+    applyBtn.textContent = "Apply & Set Up";
+    showMode("edit");
+    show(/wi-?fi/i.test(msg) ? 0 : steps.length - 1);
+    showErr("Couldn't start: " + msg);
   }
 });
 
-// Reconnect to an in-progress run on page load/refresh.
+// First paint, and reconnect to an in-progress run on page load/refresh.
+show(0, false);
 fetch("/setup/state").then(r => r.json()).then(state => {
   Object.entries(state.steps).forEach(([id, status]) => setBadge(id, status));
   if (state.running) {
-    document.getElementById("apply-btn").disabled = true;
-    document.getElementById("apply-btn").textContent = "Running...";
+    applyBtn.disabled = true;
+    applyBtn.textContent = "Running...";
+    showMode("progress");
     connectStream();
     if (state.pending_confirm) showConfirm(state.pending_confirm);
   } else if (state.finished) {
+    showMode("progress");
+    editBtn.hidden = false;
     showBanner(state.ok);
   }
 });
+{% endraw %}
 </script>
 </body>
 </html>
@@ -2943,7 +3741,7 @@ def setup():
         board=board,
         step_order=STEP_ORDER,
         step_order_json=json.dumps({sid: label for sid, label in STEP_ORDER}),
-        logo_data_uri=LOGO_DATA_URI,
+        logo_data_uri=LOGO_ON_DARK_DATA_URI,
         favicon_data_uri=FAVICON_DATA_URI,
     )
 
@@ -2984,8 +3782,20 @@ def setup_apply():
     cfg["sync"]["server_ip"] = (data.get("server_ip") or "").strip() or cfg["sync"]["server_ip"]
     cfg["sync"]["server_username"] = (data.get("server_username") or "").strip()
     cfg["sync"]["server_password"] = data.get("server_password") or ""
-    cfg["sync"]["server_path_audio"] = (data.get("server_path_audio") or "").strip() or cfg["sync"]["server_path_audio"]
-    cfg["sync"]["server_path_books"] = (data.get("server_path_books") or "").strip() or cfg["sync"]["server_path_books"]
+    for kind in ("audio", "books"):
+        for field in (f"server_share_{kind}", f"server_path_{kind}"):
+            cfg["sync"][field] = (data.get(field) or "").strip() or cfg["sync"][field]
+
+    if cfg["sync"]["enable_sync"]:
+        # Same checks the folder browser uses: nothing unvalidated may reach
+        # the sync script that runs as root.
+        try:
+            cfg["sync"]["server_ip"] = smb_clean_host(cfg["sync"]["server_ip"])
+            for kind in ("audio", "books"):
+                cfg["sync"][f"server_share_{kind}"] = smb_clean_share(cfg["sync"][f"server_share_{kind}"])
+                cfg["sync"][f"server_path_{kind}"] = "/" + "/".join(smb_clean_path(cfg["sync"][f"server_path_{kind}"]))
+        except ValueError as e:
+            return jsonify({"error": f"Auto-sync: {e}"}), 400
 
     cfg["leds"]["enabled"] = bool(data.get("leds_enabled"))
     for key, field in (("pin_wifi", "pin_wifi"), ("pin_cweb", "pin_cweb"), ("pin_abs", "pin_abs")):
@@ -3008,6 +3818,37 @@ def setup_apply():
 
     thread = threading.Thread(target=run_pipeline, args=(cfg, storage_device, format_device), daemon=True)
     thread.start()
+    return jsonify({"started": True})
+
+
+@app.route("/setup/browse", methods=["POST"])
+def setup_browse():
+    """Lists the shares on a server (no share given) or the folders inside a
+    share, for the folder picker on the Auto-sync step."""
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        server = smb_clean_host(data.get("server"))
+        username = _smb_clean_login(data.get("username"), "username").strip()
+        password = _smb_clean_login(data.get("password"), "password")
+        share = smb_clean_share(data["share"]) if (data.get("share") or "").strip() else ""
+        parts = smb_clean_path(data.get("path")) if share else []
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    problem = ensure_smbclient()
+    if problem:
+        return jsonify({"error": problem}), 503
+    result, problem = smb_browse(server, username, password, share, parts)
+    if problem:
+        return jsonify({"error": problem}), 502
+    return jsonify(result)
+
+
+@app.route("/setup/browse/prepare", methods=["POST"])
+def setup_browse_prepare():
+    """Starts installing the folder-browser tool in the background as soon as
+    auto-sync is ticked, so it's ready by the time Browse is tapped."""
+    start_smbclient_install_async()
     return jsonify({"started": True})
 
 
