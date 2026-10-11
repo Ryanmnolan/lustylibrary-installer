@@ -444,6 +444,7 @@ def apply_wifi_config_networkmanager(cfg, step_id):
             "ifname", "wlan0",
             "con-name", con_name,
             "autoconnect", "yes",
+            "connection.autoconnect-priority", "100",
             "ssid", ssid,
         ],
         step_id,
@@ -466,7 +467,11 @@ def apply_wifi_config_networkmanager(cfg, step_id):
         ],
         step_id,
     )
-    run_cmd(["nmcli", "connection", "up", con_name], step_id)
+    # Deliberately NOT bringing the hotspot up now: that would switch the Pi's
+    # only Wi-Fi radio away from your home network, cutting off this page and
+    # the internet the install still needs (Docker images, packages). The
+    # hotspot starts by itself the next time the Pi boots.
+    log_line(step_id, "Hotspot saved. It will start after the Pi reboots, so this page and the internet keep working during the install.")
 
 
 def apply_wifi_config_dhcpcd(cfg, step_id):
@@ -517,7 +522,6 @@ def apply_wifi_config_dhcpcd(cfg, step_id):
     write_file(hostapd_conf, "\n".join(lines) + "\n", step_id)
     run_cmd(["systemctl", "unmask", "hostapd"], step_id, allow_fail=True)
     run_cmd(["systemctl", "enable", "hostapd"], step_id, allow_fail=True)
-    run_cmd(["systemctl", "restart", "hostapd"], step_id, allow_fail=True)
 
     dhcpcd = Path("/etc/dhcpcd.conf")
     block = f"\ninterface wlan0\n  static ip_address={ip}/24\n  nohook wpa_supplicant\n"
@@ -534,7 +538,7 @@ def apply_wifi_config_dhcpcd(cfg, step_id):
             if not skip:
                 new_lines.append(line)
         write_file(dhcpcd, "\n".join(new_lines) + block, step_id)
-        run_cmd(["systemctl", "restart", "dhcpcd"], step_id, allow_fail=True)
+        log_line(step_id, "Hotspot saved. It will start after the Pi reboots, so this page and the internet keep working during the install.")
     else:
         log_line(step_id, "/etc/dhcpcd.conf not found, skipping static-IP step.", level="error")
 
@@ -2314,116 +2318,143 @@ WELCOME_PAGE_TEMPLATE = '''
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Welcome to the Lusty Library</title>
+  <title>Lusty Library Connection Instructions</title>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% if favicon_data_uri %}<link rel="icon" href="{{ favicon_data_uri }}">{% endif %}
   <style>
-    body { font-family: system-ui, sans-serif; background:#faf6f0; color:#2b2118; margin:0; }
-    .wrap { max-width:760px; margin:0 auto; padding:32px 20px 48px; }
-    .brand { text-align:center; margin-bottom:8px; }
-    .brand img { height:120px; width:auto; }
-    h1 { text-align:center; margin:4px 0 2px; font-size:28px; color:#4a2e0a; }
-    .subtitle { text-align:center; color:#8a6d4a; margin:0 0 28px; }
-    .card { background:#ffffff; border:1px solid #e7dcc9; padding:20px 22px; border-radius:14px;
-            margin-bottom:18px; box-shadow:0 2px 10px rgba(74,46,10,.06); }
-    .card h2 { margin:0 0 10px; font-size:18px; color:#4a2e0a; }
-    .card p { margin:4px 0; line-height:1.5; }
-    .row { display:flex; gap:20px; flex-wrap:wrap; align-items:center; }
+    @page { size: 11in 8.5in; margin: 0; }
+    * { box-sizing: border-box; }
+    html, body { margin:0; padding:0; }
+    body { background:#d9d4cb; font-family: Arial, Helvetica, sans-serif; color:#111; }
+    .toolbar { text-align:center; padding:10px 12px; font-size:15px; }
+    .toolbar a, .toolbar button { display:inline-block; margin:0 4px; padding:9px 16px; border-radius:999px; border:0;
+      background:#4a2e0a; color:#fff; text-decoration:none; font-size:15px; font-weight:700; cursor:pointer; }
+    #stage { width:11in; height:8.5in; transform-origin:0 0; margin:0 auto; }
+    .sheet { width:11in; height:8.5in; background:#fff; padding:0.35in 0.55in; position:relative; overflow:hidden;
+             box-shadow:0 4px 24px rgba(0,0,0,.25); }
+    .head { display:flex; align-items:center; justify-content:center; gap:22px; }
+    .head img { height:0.95in; width:auto; }
+    h1 { margin:0; font-size:44px; font-weight:700; line-height:1.05; text-align:center; }
+    .sub { text-align:center; font-size:24px; margin:6px 0 14px; }
+    .cols { display:grid; grid-template-columns: 1fr 1fr; gap:0.4in; align-items:start; }
+    .sec { margin-bottom:0.16in; }
+    h2 { margin:0 0 6px; font-size:25px; font-weight:700; }
+    p { margin:0 0 5px; font-size:18px; line-height:1.28; }
+    .row { display:flex; gap:18px; align-items:flex-start; }
     .qr { text-align:center; }
-    .qr img { width:140px; height:140px; background:#fff; padding:6px; border-radius:8px; border:1px solid #e7dcc9; }
-    .qr small { display:block; margin-top:6px; color:#8a6d4a; }
-    .kv { background:#faf6f0; border-radius:8px; padding:10px 14px; font-family:ui-monospace,Menlo,Consolas,monospace;
-          font-size:14px; display:inline-block; }
-    .note { color:#8a6d4a; font-size:13px; }
-    .led-list { list-style:none; padding:0; margin:0; }
-    .led-list li { display:flex; align-items:center; gap:10px; padding:4px 0; }
-    .dot { width:14px; height:14px; border-radius:50%; flex-shrink:0; display:inline-block; }
-    .dot.green { background:#22c55e; }
-    .dot.blue { background:#3b82f6; }
-    .dot.yellow { background:#eab308; }
+    .qr img { width:1.35in; height:1.35in; display:block; }
+    .qr span { display:block; font-size:21px; font-weight:700; margin-top:2px; }
+    .qrs { display:flex; gap:0.45in; margin:4px 0 8px; }
+    .big { font-size:23px; font-weight:700; }
+    .kv { font-family: "Courier New", monospace; font-weight:700; }
+    .wifi { border:3px solid #111; border-radius:10px; padding:8px 14px; margin-bottom:0.16in; }
+    .wifi p { margin:2px 0; font-size:21px; }
+    .leds p { display:flex; align-items:center; gap:10px; margin:3px 0; font-size:20px; }
+    .dot { width:20px; height:20px; border-radius:50%; flex-shrink:0; border:1px solid rgba(0,0,0,.4); }
+    .dot.green { background:#22c55e; } .dot.blue { background:#3b82f6; } .dot.yellow { background:#facc15; }
     @media print {
       body { background:#fff; }
-      .card { box-shadow:none; }
+      .toolbar { display:none; }
+      #stage { transform:none !important; margin:0; }
+      .sheet { box-shadow:none; }
     }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="brand">
-      {% if logo_data_uri %}<img src="{{ logo_data_uri }}" alt="Lusty Library logo">{% endif %}
-    </div>
-    <h1>Welcome to the Lusty Library</h1>
-    <p class="subtitle">Everything you need to connect, read, and listen.</p>
-
-    <div class="card">
-      <h2>📶 Connect to Wi-Fi</h2>
-      <p>Network name (SSID): <span class="kv">{{ wifi_ssid }}</span></p>
-      <p>Password: <span class="kv">{{ wifi_password }}</span></p>
-    </div>
-
-    {% if show_ebooks %}
-    <div class="card">
-      <h2>📖 eBooks</h2>
-      <div class="row">
-        {% if ebook_qr %}
-        <div class="qr"><img src="{{ ebook_qr }}" alt="eBooks QR code"><small>Scan to open</small></div>
-        {% endif %}
-        <div>
-          <p>Or open <span class="kv">{{ ebook_url }}</span> in a browser.</p>
-          {% if ebook_login_note %}<p class="note">{{ ebook_login_note }}</p>{% endif %}
-        </div>
-      </div>
-    </div>
-    {% endif %}
-
-    {% if show_audiobooks %}
-    <div class="card">
-      <h2>🎧 Audiobooks</h2>
-      <p>Install the free <strong>Audiobookshelf</strong> app, then add this server address:</p>
-      <p><span class="kv">{{ audiobook_url }}</span></p>
-      {% if audiobook_login_note %}<p class="note">{{ audiobook_login_note }}</p>{% endif %}
-      <div class="row" style="margin-top:10px;">
-        {% if abs_ios_qr %}
-        <div class="qr"><img src="{{ abs_ios_qr }}" alt="iOS app QR code"><small>iOS</small></div>
-        {% endif %}
-        {% if abs_android_qr %}
-        <div class="qr"><img src="{{ abs_android_qr }}" alt="Android app QR code"><small>Android</small></div>
-        {% endif %}
-      </div>
-    </div>
-    {% endif %}
-
-    {% if show_requests %}
-    <div class="card">
-      <h2>🙋 Request New Books or Audiobooks</h2>
-      <div class="row">
-        {% if requests_qr %}
-        <div class="qr"><img src="{{ requests_qr }}" alt="Request page QR code"><small>Scan to request</small></div>
-        {% endif %}
-        <p>Or visit <span class="kv">{{ requests_url }}</span></p>
-      </div>
-    </div>
-    {% endif %}
-
-    {% if show_shutdown %}
-    <div class="card">
-      <h2>⏻ Shutting Down</h2>
-      <p>Press and hold the shutdown button for about {{ shutdown_hold_secs }} seconds. The status
-      LEDs will flash a few times, then it's safe to unplug the power.</p>
-    </div>
-    {% endif %}
-
-    {% if show_leds %}
-    <div class="card">
-      <h2>💡 LED Indicators</h2>
-      <ul class="led-list">
-        <li><span class="dot green"></span> Green — Wi-Fi ready</li>
-        {% if show_ebooks %}<li><span class="dot yellow"></span> Yellow — eBooks ready</li>{% endif %}
-        {% if show_audiobooks %}<li><span class="dot blue"></span> Blue — Audiobooks ready</li>{% endif %}
-      </ul>
-    </div>
-    {% endif %}
+  <div class="toolbar">
+    <button type="button" onclick="window.print()">Print</button>
+    <a href="/welcome.pdf" target="_blank">Download PDF</a>
   </div>
+  <div id="stage"><div class="sheet">
+    <div class="head">
+      {% if logo_data_uri %}<img src="{{ logo_data_uri }}" alt="Lusty Library logo">{% endif %}
+      <h1>Welcome to the Lusty Library</h1>
+    </div>
+    <div class="sub">Lusty Library Connection Instructions</div>
+
+    <div class="cols">
+      <div>
+        <div class="wifi">
+          <p>Once the <strong>green LED</strong> is on, connect to the Wi-Fi. Please connect without internet access.</p>
+          <p>Network: <span class="kv">{{ wifi_ssid }}</span></p>
+          <p>Password: <span class="kv">{{ wifi_password }}</span></p>
+        </div>
+
+        {% if show_ebooks %}
+        <div class="sec">
+          <h2>For eBooks:</h2>
+          <div class="row">
+            {% if ebook_qr %}<div class="qr"><img src="{{ ebook_qr }}" alt="eBooks QR code"></div>{% endif %}
+            <div>
+              <p>Scan the QR code for eBooks.</p>
+              {% if ebook_login_note %}<p class="big">{{ ebook_login_note }}</p>{% endif %}
+              {% if not ebook_qr %}<p>Open <span class="kv">{{ ebook_url }}</span></p>{% endif %}
+            </div>
+          </div>
+        </div>
+        {% endif %}
+
+        {% if show_requests %}
+        <div class="sec">
+          <h2>To Request New Books or Audiobooks:</h2>
+          <div class="row">
+            {% if requests_qr %}<div class="qr"><img src="{{ requests_qr }}" alt="Request page QR code"></div>{% endif %}
+            <div>
+              <p>Scan the QR code and fill out the request form. Requested titles will be added before your next visit.</p>
+              {% if not requests_qr %}<p>Visit <span class="kv">{{ requests_url }}</span></p>{% endif %}
+            </div>
+          </div>
+        </div>
+        {% endif %}
+      </div>
+
+      <div>
+        {% if show_audiobooks %}
+        <div class="sec">
+          <h2>For Audiobooks:</h2>
+          <p>Please download the Audiobookshelf app for your phone <strong>before</strong> connecting to the Wi-Fi. Scan the QR code for Android or iOS.</p>
+          <div class="qrs">
+            {% if abs_ios_qr %}<div class="qr"><img src="{{ abs_ios_qr }}" alt="iOS app QR code"><span>iOS</span></div>{% endif %}
+            {% if abs_android_qr %}<div class="qr"><img src="{{ abs_android_qr }}" alt="Android app QR code"><span>Android</span></div>{% endif %}
+          </div>
+          <p>After installing, connect to the Wi-Fi and, inside the app, use <span class="kv">{{ audiobook_url }}</span> as the server address.</p>
+          {% if audiobook_login_note %}<p class="big">{{ audiobook_login_note }}</p>{% endif %}
+        </div>
+        {% endif %}
+
+        {% if show_leds %}
+        <div class="sec leds">
+          <h2>LED Indicators:</h2>
+          <p><span class="dot green"></span> Green Light = Wi-Fi is ready</p>
+          {% if show_audiobooks %}<p><span class="dot blue"></span> Blue Light = Audiobooks are ready</p>{% endif %}
+          {% if show_ebooks %}<p><span class="dot yellow"></span> Yellow Light = eBooks are ready</p>{% endif %}
+        </div>
+        {% endif %}
+
+        {% if show_shutdown %}
+        <div class="sec">
+          <h2>To Shut Down the Server:</h2>
+          <p>Press and hold the button for {{ shutdown_hold_secs }} seconds. Once all LEDs are off, unplug from the wall.</p>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div></div>
+  <script>
+  (function () {
+    var stage = document.getElementById("stage");
+    function fit() {
+      var w = 11 * 96, h = 8.5 * 96;
+      var s = Math.min(1, window.innerWidth / w);
+      stage.style.transform = "scale(" + s + ")";
+      stage.style.marginLeft = s < 1 ? "0" : "auto";
+      stage.style.height = (h * s) + "px";
+      stage.style.width = (w * s) + "px";
+      stage.firstElementChild.style.transformOrigin = "0 0";
+    }
+    fit(); window.addEventListener("resize", fit);
+  })();
+  </script>
 </body>
 </html>
 '''
@@ -2483,7 +2514,7 @@ def _welcome_context(cfg):
         "requests_url": requests_url,
         "ebook_login_note": _account_note(cfg["apps"]["calibre_account_status"], username, password) if show_ebooks else "",
         "audiobook_login_note": _account_note(cfg["apps"]["audiobookshelf_account_status"], username, password) if show_audiobooks else "",
-        "shutdown_hold_secs": cfg["shutdown_button"]["hold_secs"],
+        "shutdown_hold_secs": f"{float(cfg['shutdown_button']['hold_secs']):g}",
         "ebook_qr": get_cached_qr(cache, "ebook", ebook_url) if show_ebooks else "",
         "abs_ios_qr": get_cached_qr(cache, "abs_ios", ABS_IOS_SEARCH_URL) if show_audiobooks else "",
         "abs_android_qr": get_cached_qr(cache, "abs_android", ABS_ANDROID_SEARCH_URL) if show_audiobooks else "",
@@ -2514,118 +2545,172 @@ def _data_uri_to_buf(data_uri):
 
 
 def render_welcome_pdf_bytes(cfg):
-    """Builds the welcome page as a PDF directly with reportlab (no HTML
-    rendering step involved), from the same context as the on-screen
-    welcome page, so the two always agree on content."""
+    """Builds the welcome sign as a landscape US-Letter PDF directly with
+    reportlab (no HTML rendering step involved), from the same context as
+    the on-screen welcome page, so the two always agree on content."""
     from xml.sax.saxutils import escape
 
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_CENTER
-    from reportlab.lib.pagesizes import LETTER
-    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-    from reportlab.platypus import HRFlowable, Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.lib.pagesizes import LETTER, landscape
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import (
+        BaseDocTemplate, Flowable, Frame, FrameBreak, Image, PageTemplate, Paragraph, Spacer, Table, TableStyle,
+    )
 
     ctx = _welcome_context(cfg)
+    page_w, page_h = landscape(LETTER)
+    margin = 36
+    gap = 28
+    col_w = (page_w - 2 * margin - gap) / 2
+    head_h = 110
 
-    styles = getSampleStyleSheet()
-    heading_color = colors.HexColor("#4a2e0a")
-    muted_color = colors.HexColor("#8a6d4a")
-    rule_color = colors.HexColor("#e7dcc9")
-    kv_bg = colors.HexColor("#faf6f0")
+    title = ParagraphStyle("T", fontName="Helvetica-Bold", fontSize=32, leading=36, alignment=TA_CENTER)
+    sub = ParagraphStyle("S", fontName="Helvetica", fontSize=17, leading=20, alignment=TA_CENTER, spaceAfter=4)
+    h2 = ParagraphStyle("H", fontName="Helvetica-Bold", fontSize=17, leading=20, spaceAfter=4)
+    body = ParagraphStyle("B", fontName="Helvetica", fontSize=13, leading=16, spaceAfter=4)
+    big = ParagraphStyle("G", fontName="Helvetica-Bold", fontSize=15, leading=18, spaceAfter=4)
+    cap = ParagraphStyle("C", fontName="Helvetica-Bold", fontSize=14, leading=16, alignment=TA_CENTER)
 
-    title_style = ParagraphStyle("WelcomeTitle", parent=styles["Title"], textColor=heading_color, fontSize=22, alignment=TA_CENTER)
-    subtitle_style = ParagraphStyle("WelcomeSubtitle", parent=styles["Normal"], textColor=muted_color, alignment=TA_CENTER, spaceAfter=14)
-    heading_style = ParagraphStyle("CardHeading", parent=styles["Heading2"], textColor=heading_color, spaceAfter=4)
-    body_style = ParagraphStyle("CardBody", parent=styles["Normal"], spaceAfter=3, leading=14)
-    kv_style = ParagraphStyle(
-        "KV", parent=styles["Normal"], fontName="Courier", backColor=kv_bg, borderPadding=4, spaceAfter=3
-    )
-    note_style = ParagraphStyle("Note", parent=styles["Normal"], textColor=muted_color, fontSize=9)
+    class Dot(Flowable):
+        """A coloured LED dot followed by its label."""
+        def __init__(self, color, label):
+            super().__init__()
+            self.color, self.label = color, label
+            self.width, self.height = col_w, 22
+
+        def draw(self):
+            c = self.canv
+            c.setFillColor(colors.HexColor(self.color))
+            c.setStrokeColor(colors.HexColor("#444444"))
+            c.circle(8, 9, 7, stroke=1, fill=1)
+            c.setFillColor(colors.black)
+            c.setFont("Helvetica", 14)
+            c.drawString(24, 4, self.label)
+
+    class Box(Flowable):
+        """Outlined box holding flowables (the Wi-Fi notice)."""
+        def __init__(self, flowables, width):
+            super().__init__()
+            self.flowables, self.width_ = flowables, width
+            pad = 8
+            self.pad = pad
+            self.inner = []
+            h = 0
+            for f in flowables:
+                w, fh = f.wrap(width - 2 * pad, 1000)
+                h += fh
+            self.height = h + 2 * pad
+            self.width = width
+
+        def wrap(self, aw, ah):
+            return self.width, self.height
+
+        def draw(self):
+            c = self.canv
+            c.setLineWidth(2)
+            c.roundRect(0, 0, self.width, self.height, 7, stroke=1, fill=0)
+            y = self.height - self.pad
+            for f in self.flowables:
+                w, fh = f.wrap(self.width - 2 * self.pad, 1000)
+                y -= fh
+                f.drawOn(c, self.pad, y)
+
+    def qr_img(data_uri, size=96):
+        buf = _data_uri_to_buf(data_uri)
+        return Image(buf, width=size, height=size) if buf else None
+
+    def qr_row(data_uri, flowables, size=96):
+        img = qr_img(data_uri, size)
+        if not img:
+            return flowables
+        t = Table([[img, flowables]], colWidths=[size + 12, col_w - size - 12])
+        t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                               ("TOPPADDING", (0, 0), (-1, -1), 0)]))
+        return [t]
+
+    P = lambda text, st=body: Paragraph(text, st)
+    mono = lambda s: f'<font name="Courier-Bold">{escape(s)}</font>'
 
     story = []
+    # header
+    logo = _data_uri_to_buf(ctx["logo_data_uri"])
+    head_cells = []
+    if logo:
+        head_cells.append(Image(logo, width=72, height=72))
+    head_cells.append([P("Welcome to the Lusty Library", title), P("Lusty Library Connection Instructions", sub)])
+    ht = Table([head_cells], colWidths=([84] if logo else []) + [None])
+    ht.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
+    story.append(ht)
+    story.append(FrameBreak())
 
-    logo_buf = _data_uri_to_buf(ctx["logo_data_uri"])
-    if logo_buf:
-        logo_img = Image(logo_buf, width=90, height=90)
-        logo_img.hAlign = "CENTER"
-        story.append(logo_img)
-        story.append(Spacer(1, 6))
-
-    story.append(Paragraph("Welcome to the Lusty Library", title_style))
-    story.append(Paragraph("Everything you need to connect, read, and listen.", subtitle_style))
-
-    def add_card(heading, flowables):
-        story.append(Paragraph(escape(heading), heading_style))
-        story.extend(flowables)
-        story.append(Spacer(1, 6))
-        story.append(HRFlowable(width="100%", thickness=0.75, color=rule_color))
-        story.append(Spacer(1, 10))
-
-    def with_qr(qr_data_uri, text_flowables, qr_size=80):
-        """Lays `text_flowables` next to a QR image (if one is cached),
-        or just returns them alone if there isn't one."""
-        qr_buf = _data_uri_to_buf(qr_data_uri)
-        if not qr_buf:
-            return text_flowables
-        qr_img = Image(qr_buf, width=qr_size, height=qr_size)
-        table = Table([[qr_img, text_flowables]], colWidths=[qr_size + 10, None])
-        table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (0, 0), 0)]))
-        return [table]
-
-    add_card("Connect to Wi-Fi", [
-        Paragraph(f"Network name (SSID): {escape(ctx['wifi_ssid'])}", kv_style),
-        Paragraph(f"Password: {escape(ctx['wifi_password'])}", kv_style),
-    ])
-
+    # left column
+    story.append(Box([
+        P("Once the <b>green LED</b> is on, connect to the Wi-Fi. Please connect without internet access.", body),
+        P(f"Network: {mono(ctx['wifi_ssid'])} &nbsp; Password: {mono(ctx['wifi_password'])}", body),
+    ], col_w))
+    story.append(Spacer(1, 12))
     if ctx["show_ebooks"]:
-        text = [Paragraph(f"Open {escape(ctx['ebook_url'])} in a browser.", body_style)]
+        text = [P("Scan the QR code for eBooks.")]
         if ctx["ebook_login_note"]:
-            text.append(Paragraph(escape(ctx["ebook_login_note"]), note_style))
-        add_card("eBooks", with_qr(ctx["ebook_qr"], text))
-
-    if ctx["show_audiobooks"]:
-        flowables = [
-            Paragraph("Install the free Audiobookshelf app, then add this server address:", body_style),
-            Paragraph(escape(ctx["audiobook_url"]), kv_style),
-        ]
-        if ctx["audiobook_login_note"]:
-            flowables.append(Paragraph(escape(ctx["audiobook_login_note"]), note_style))
-        ios_buf = _data_uri_to_buf(ctx["abs_ios_qr"])
-        android_buf = _data_uri_to_buf(ctx["abs_android_qr"])
-        if ios_buf or android_buf:
-            row = []
-            if ios_buf:
-                row.append(Image(ios_buf, width=70, height=70))
-            if android_buf:
-                row.append(Image(android_buf, width=70, height=70))
-            qr_table = Table([row])
-            flowables.append(Spacer(1, 4))
-            flowables.append(qr_table)
-        add_card("Audiobooks", flowables)
-
+            text.append(P(escape(ctx["ebook_login_note"]), big))
+        if not ctx["ebook_qr"]:
+            text.append(P(f"Open {mono(ctx['ebook_url'])}"))
+        story.append(P("For eBooks:", h2))
+        story.extend(qr_row(ctx["ebook_qr"], text))
+        story.append(Spacer(1, 12))
     if ctx["show_requests"]:
-        text = [Paragraph(f"Or visit {escape(ctx['requests_url'])}", body_style)]
-        add_card("Request New Books or Audiobooks", with_qr(ctx["requests_qr"], text))
+        text = [P("Scan the QR code and fill out the request form. Requested titles will be added before your next visit.")]
+        if not ctx["requests_qr"]:
+            text.append(P(f"Visit {mono(ctx['requests_url'])}"))
+        story.append(P("To Request New Books or Audiobooks:", h2))
+        story.extend(qr_row(ctx["requests_qr"], text))
+    story.append(FrameBreak())
 
-    if ctx["show_shutdown"]:
-        add_card("Shutting Down", [
-            Paragraph(
-                f"Press and hold the shutdown button for about {ctx['shutdown_hold_secs']} seconds. "
-                "The status LEDs will flash a few times, then it's safe to unplug the power.",
-                body_style,
-            )
-        ])
-
+    # right column
+    if ctx["show_audiobooks"]:
+        story.append(P("For Audiobooks:", h2))
+        story.append(P("Please download the Audiobookshelf app for your phone <b>before</b> connecting to the Wi-Fi. "
+                       "Scan the QR code for Android or iOS."))
+        cells, labels = [], []
+        for key, label in (("abs_ios_qr", "iOS"), ("abs_android_qr", "Android")):
+            img = qr_img(ctx[key], 90)
+            if img:
+                cells.append(img)
+                labels.append(P(label, cap))
+        if cells:
+            qt = Table([cells, labels], colWidths=[110] * len(cells))
+            qt.setStyle(TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER"), ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
+            qt.hAlign = "LEFT"
+            story.append(qt)
+            story.append(Spacer(1, 6))
+        story.append(P(f"After installing, connect to the Wi-Fi and, inside the app, use {mono(ctx['audiobook_url'])} as the server address."))
+        if ctx["audiobook_login_note"]:
+            story.append(P(escape(ctx["audiobook_login_note"]), big))
+        story.append(Spacer(1, 10))
     if ctx["show_leds"]:
-        led_lines = ["● Green — Wi-Fi ready"]
-        if ctx["show_ebooks"]:
-            led_lines.append("● Yellow — eBooks ready")
+        story.append(P("LED Indicators:", h2))
+        story.append(Dot("#22c55e", "Green Light = Wi-Fi is ready"))
         if ctx["show_audiobooks"]:
-            led_lines.append("● Blue — Audiobooks ready")
-        add_card("LED Indicators", [Paragraph(line, body_style) for line in led_lines])
+            story.append(Dot("#3b82f6", "Blue Light = Audiobooks are ready"))
+        if ctx["show_ebooks"]:
+            story.append(Dot("#facc15", "Yellow Light = eBooks are ready"))
+        story.append(Spacer(1, 10))
+    if ctx["show_shutdown"]:
+        story.append(P("To Shut Down the Server:", h2))
+        story.append(P(f"Press and hold the button for {ctx['shutdown_hold_secs']} seconds. "
+                       "Once all LEDs are off, unplug from the wall."))
 
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=LETTER, topMargin=40, bottomMargin=40, leftMargin=54, rightMargin=54)
+    doc = BaseDocTemplate(buf, pagesize=(page_w, page_h), leftMargin=margin, rightMargin=margin,
+                          topMargin=margin, bottomMargin=margin, title="Lusty Library Connection Instructions")
+    body_h = page_h - 2 * margin - head_h
+    frames = [
+        Frame(margin, page_h - margin - head_h, page_w - 2 * margin, head_h, id="head", leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0),
+        Frame(margin, margin, col_w, body_h, id="left", leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0),
+        Frame(margin + col_w + gap, margin, col_w, body_h, id="right", leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0),
+    ]
+    doc.addPageTemplates([PageTemplate(id="sign", frames=frames)])
     doc.build(story)
     return buf.getvalue()
 
@@ -3603,7 +3688,20 @@ function showBanner(ok) {
   if (ok) {
     b.innerHTML = 'Setup finished successfully. ' +
       '<a href="/welcome" target="_blank">View the welcome page</a> &middot; ' +
-      '<a href="/welcome.pdf" target="_blank">Download the printable PDF</a>';
+      '<a href="/welcome.pdf" target="_blank">Download the printable PDF</a>' +
+      '<div style="margin-top:10px;font-weight:400">One last step: reboot the Pi to start your Wi-Fi hotspot. ' +
+      'After it restarts, join the Wi-Fi network you chose and open the welcome page there. ' +
+      'This page will stop working when the Pi reboots.</div>' +
+      '<button type="button" id="reboot-btn" style="margin-top:10px;padding:10px 16px;border-radius:999px;border:0;font-weight:700;background:#10b981;color:#052e22;cursor:pointer">Reboot now</button>';
+    const rb = document.getElementById("reboot-btn");
+    rb.onclick = function () {
+      if (!confirm("Reboot the Pi now? This page will disconnect.")) return;
+      rb.disabled = true; rb.textContent = "Rebooting...";
+      fetch("/setup/reboot", {method: "POST"})
+        .then(function (r) { return r.json(); })
+        .then(function (d) { rb.textContent = d.error ? "Could not reboot" : "Rebooting - rejoin the hotspot in about a minute"; })
+        .catch(function () { rb.textContent = "Rebooting - rejoin the hotspot in about a minute"; });
+    };
   } else {
     b.textContent = "Setup stopped due to an error — see the console below. You can go back, change settings and try again.";
   }
@@ -3872,6 +3970,23 @@ def welcome_pdf():
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": f"Couldn't generate the PDF: {e}"}), 500
     return Response(pdf_bytes, mimetype="application/pdf")
+
+
+@app.route("/setup/reboot", methods=["POST"])
+def setup_reboot():
+    """Reboot the Pi (after a successful setup) so the saved hotspot starts."""
+    with STATE_LOCK:
+        allowed = STATE["finished"] and STATE["ok"] and not STATE["running"]
+    if not allowed:
+        return jsonify({"error": "Setup has not finished successfully yet."}), 409
+    try:
+        subprocess.Popen(
+            ["systemd-run", "--on-active=3", "systemctl", "reboot"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError as e:
+        return jsonify({"error": f"Could not start the reboot: {e}"}), 500
+    return jsonify({"ok": True})
 
 
 @app.route("/setup/state", methods=["GET"])
