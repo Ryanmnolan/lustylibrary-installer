@@ -52,6 +52,39 @@ def load_logo_data_uri():
 
 LOGO_DATA_URI = load_logo_data_uri()
 
+
+def load_logo_on_dark_data_uri():
+    """The logo file is black artwork on a white background, which turns into
+    a muddy dark blob (with a speckled edge) on the setup/request pages' dark
+    theme. This converts it, once at startup, into light-coloured artwork on
+    a transparent background — cropped tight and scaled down, so it's crisp
+    on dark pages and far smaller to embed than the full-size original. The
+    printable welcome page (white background) keeps using the original.
+    Falls back to the original if Pillow isn't available."""
+    try:
+        from PIL import Image, ImageOps
+
+        ink = ImageOps.invert(Image.open(LOGO_PATH).convert("L"))
+        # Levels: crush the paper's faint speckle to nothing, keep solid ink.
+        ink = ink.point(lambda v: 0 if v < 70 else (255 if v > 170 else int((v - 70) * 255 / 100)))
+        bbox = ink.getbbox()
+        if bbox:
+            pad = 12
+            l, t, r, b = bbox
+            ink = ink.crop((max(0, l - pad), max(0, t - pad), min(ink.width, r + pad), min(ink.height, b + pad)))
+        width = 480
+        ink = ink.resize((width, max(1, round(ink.height * width / ink.width))), Image.LANCZOS)
+        out = Image.new("RGBA", ink.size, (243, 244, 246, 0))
+        out.putalpha(ink)
+        buf = io.BytesIO()
+        out.save(buf, "PNG", optimize=True)
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:  # noqa: BLE001 - purely cosmetic, never block startup
+        return LOGO_DATA_URI
+
+
+LOGO_ON_DARK_DATA_URI = load_logo_on_dark_data_uri()
+
 # A little book emoji, baked into an inline SVG, used only as the browser-tab
 # favicon. The full Lusty Library logo image is the header's main visual on
 # every page; this just gives the tab itself a recognizable icon.
@@ -1035,7 +1068,7 @@ def generate_requests_page_script(cfg):
     media_root = cfg["storage"]["media_root"]
     csv_path = str(Path(media_root) / "requests.csv")
     port = cfg["requests_page"]["port"]
-    logo_data_uri = LOGO_DATA_URI
+    logo_data_uri = LOGO_ON_DARK_DATA_URI
     favicon_data_uri = FAVICON_DATA_URI
 
     return f'''#!/usr/bin/env python3
@@ -2534,25 +2567,66 @@ FORM_TEMPLATE = """
   <meta name="viewport" content="width=device-width,initial-scale=1">
   {% if favicon_data_uri %}<link rel="icon" href="{{ favicon_data_uri }}">{% endif %}
   <style>
-    body { font-family: system-ui, sans-serif; background:#111827; color:#f9fafb; margin:0; }
-    .wrap { max-width:900px; margin:4vh auto; padding:0 16px 40px; }
-    .card { background:#1f2937; padding:24px; border-radius:16px; box-shadow:0 10px 40px rgba(0,0,0,.6); margin-bottom:20px; }
-    h1 { margin-top:0; }
-    fieldset { border:1px solid #374151; margin-bottom:18px; border-radius:8px; }
-    legend { padding:0 8px; color:#9ca3af; }
-    label { display:block; margin:8px 0; }
-    input,select { width:100%; padding:8px; border-radius:6px; border:1px solid #4b5563;
-                   background:#030712; color:#e5e7eb; box-sizing:border-box; }
-    .row { display:flex; gap:12px; }
-    .row > div { flex:1; }
-    button { background:#10b981; color:#022c22; border:0; padding:10px 18px; border-radius:999px;
-             font-weight:600; cursor:pointer; margin-top:10px; font-size:15px; }
-    button:hover:not(:disabled) { background:#059669; }
+    :root { --bg:#111827; --card:#1f2937; --line:#374151; --muted:#9ca3af; --accent:#10b981; --accent-dark:#059669; }
+    * { box-sizing:border-box; }
+    [hidden] { display:none !important; }
+    body { font-family: system-ui, sans-serif; background:var(--bg); color:#f9fafb; margin:0; }
+    .wrap { max-width:640px; margin:0 auto; padding:20px 16px 48px; }
+    .card { background:var(--card); padding:22px; border-radius:16px; box-shadow:0 10px 40px rgba(0,0,0,.6); margin-bottom:20px; }
+    h1 { margin:0; font-size:26px; }
+    h2 { margin:0; font-size:20px; }
+    h3 { margin:0; font-size:15px; }
+    label { display:block; margin:12px 0 0; font-size:15px; }
+    input, select { width:100%; padding:12px; margin-top:6px; border-radius:8px; border:1px solid #4b5563;
+                    background:#030712; color:#e5e7eb; font-size:16px; font-family:inherit; }
+    input:focus, select:focus { outline:2px solid var(--accent); outline-offset:1px; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; }
+    .row > div { flex:1 1 150px; min-width:0; }
+    button { background:var(--accent); color:#022c22; border:0; padding:12px 20px; border-radius:999px;
+             font-weight:600; cursor:pointer; font-size:16px; font-family:inherit; }
+    button:hover:not(:disabled) { background:var(--accent-dark); }
     button:disabled { background:#4b5563; color:#9ca3af; cursor:not-allowed; }
-    .checkbox-row { display:flex; align-items:center; gap:8px; }
-    .checkbox-row input { width:auto; }
-    small { color:#9ca3af; }
-    .board-info { color:#9ca3af; font-size:14px; margin-bottom:20px; }
+    button.secondary { background:#374151; color:#f9fafb; }
+    button.secondary:hover:not(:disabled) { background:#4b5563; }
+    small, .hint { color:var(--muted); font-size:13px; line-height:1.45; display:block; margin-top:6px; }
+    code { background:#030712; padding:1px 5px; border-radius:4px; }
+
+    .brand { text-align:center; }
+    .brand img { width:min(180px, 50vw); height:auto; display:block; margin:0 auto 6px; }
+    .board-info { color:var(--muted); font-size:13px; text-align:center; margin:4px 0 0; }
+
+    .progress { display:flex; gap:6px; margin:20px 0 14px; }
+    .seg { flex:1; height:8px; border-radius:99px; background:var(--line); }
+    .seg.done { background:var(--accent); }
+    .seg.current { background:#6ee7b7; }
+    .seg.clickable { cursor:pointer; }
+    .step-count { color:var(--muted); font-size:13px; text-transform:uppercase; letter-spacing:.06em; }
+    .step-title { margin:2px 0 6px; font-size:24px; }
+    .step-intro { color:#d1d5db; font-size:15px; line-height:1.5; margin:0 0 4px; }
+    .step { display:none; }
+    .step.active { display:block; }
+
+    .check { display:flex; align-items:center; gap:12px; padding:14px; margin:12px 0 0; background:#030712;
+             border:1px solid var(--line); border-radius:10px; cursor:pointer; font-size:16px; }
+    .check input { width:22px; height:22px; margin:0; flex-shrink:0; accent-color:var(--accent); }
+    .opt-details { margin-top:4px; padding-left:2px; }
+    .warn-box { background:#450a0a; color:#fecaca; border-radius:8px; padding:12px 14px; margin-top:12px; font-size:14px; line-height:1.45; }
+
+    .step-error { display:none; background:#450a0a; color:#fecaca; border-radius:8px; padding:12px 14px; margin-top:16px; font-size:14px; line-height:1.45; }
+    .step-error.show { display:block; }
+    .nav { display:flex; gap:12px; margin-top:20px; }
+    .nav button { flex:1; padding:14px 18px; }
+
+    .rv-group { background:#030712; border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin-top:12px; }
+    .rv-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+    .rv-head a { color:#6ee7b7; font-size:14px; }
+    .rv-row { display:flex; justify-content:space-between; gap:12px; padding:4px 0; font-size:14px; }
+    .rv-row span { color:var(--muted); flex-shrink:0; }
+    .rv-row strong { font-weight:600; text-align:right; word-break:break-word; }
+    .rv-row.warn strong { color:#fca5a5; }
+
+    .progress-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px; }
+    .progress-head button { padding:8px 14px; font-size:14px; }
     #steps { list-style:none; padding:0; margin:0 0 16px; }
     #steps li { display:flex; align-items:center; gap:10px; padding:6px 0; font-size:15px; }
     .badge { display:inline-flex; align-items:center; justify-content:center; width:20px; height:20px;
@@ -2568,215 +2642,213 @@ FORM_TEMPLATE = """
                 white-space:pre-wrap; word-break:break-all; }
     #console .line-error { color:#f87171; }
     #console .line-cmd { color:#93c5fd; }
-    #banner { display:none; padding:12px 16px; border-radius:8px; margin-bottom:16px; font-weight:600; }
+    #banner { display:none; padding:12px 16px; border-radius:8px; margin-bottom:16px; font-weight:600; line-height:1.5; }
     #banner.ok { display:block; background:#064e3b; color:#a7f3d0; }
     #banner.fail { display:block; background:#450a0a; color:#fecaca; }
     #banner a { color:inherit; text-decoration:underline; }
-    .brand { display:flex; align-items:center; gap:14px; }
-    .brand img { height:96px; width:auto; }
-    .brand h1 { margin:0; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="card">
       <div class="brand">
-        {% if logo_data_uri %}<img src="{{ logo_data_uri }}" alt="Lusty Library logo">{% endif %}
-        <h1>Lusty Library Setup</h1>
+        {% if logo_data_uri %}<img src="{{ logo_data_uri }}" alt="Lusty Library"><h1>Setup</h1>{% else %}<h1>Lusty Library Setup</h1>{% endif %}
       </div>
       <div class="board-info">
-        Board: {{ board.model }} &middot; OS: {{ board.os_codename }} &middot; Arch: {{ board.arch }}
+        {{ board.model }} &middot; {{ board.os_codename }} &middot; {{ board.arch }}
       </div>
 
-      <div id="banner"></div>
+      <div id="wizard-body">
+        <div class="progress" id="segs"></div>
+        <div class="step-count" id="step-count"></div>
+        <h2 class="step-title" id="step-title"></h2>
 
-      <form id="setup-form">
-        <fieldset>
-          <legend>Wi-Fi / Hotspot</legend>
-          <div class="row">
-            <div>
-              <label>SSID
-                <input name="wifi_ssid" value="{{ cfg.wifi.ssid }}" placeholder="e.g. LustyLibrary">
+        <form id="setup-form" novalidate>
+
+          <section class="step" data-title="Wi-Fi hotspot">
+            <p class="step-intro">This is the Wi-Fi network patrons join to reach the library. It works with no other internet connection.</p>
+            <label>Network name (SSID)
+              <input name="wifi_ssid" value="{{ cfg.wifi.ssid }}" placeholder="e.g. LustyLibrary" autocomplete="off">
+            </label>
+            <label>Password
+              <input name="wifi_password" value="{{ cfg.wifi.password }}" placeholder="e.g. lustybooks123" autocomplete="off">
+              <small>Must be 8-63 characters &mdash; WPA2 won't accept anything shorter.</small>
+            </label>
+            <label>Hotspot IP address (wlan0)
+              <input name="wifi_ip" value="{{ cfg.wifi.ip }}" placeholder="e.g. 10.10.10.10" inputmode="decimal" autocomplete="off">
+              <small>Uses NetworkManager on newer Raspberry Pi OS, or hostapd/dhcpcd on older images &mdash; picked automatically.</small>
+            </label>
+          </section>
+
+          <section class="step" data-title="Storage">
+            <p class="step-intro">Where the books and audiobooks are kept.</p>
+            <label>Media folder
+              <input name="media_root" value="{{ cfg.storage.media_root }}" placeholder="e.g. /mnt/media" autocomplete="off">
+              <small>Subfolders <code>audiobooks</code>, <code>books</code> and <code>config</code> are created here.</small>
+            </label>
+            <label>USB drive to use (optional)
+              <select name="storage_device">
+                <option value="">Keep existing storage as-is</option>
+                {% for d in devices %}
+                  <option value="{{ d.path }}">{{ d.path }} ({{ d.size }}, {{ d.fstype or 'unformatted' }}, {% if d.mountpoint %}mounted at {{ d.mountpoint }}{% else %}not mounted{% endif %})</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="format_device" name="format_device" data-warn="format-warning">
+              <span>Format the selected drive as ext4 and mount it at the media folder</span>
+            </label>
+            <div class="warn-box" id="format-warning" hidden>&#9888; This erases everything on the selected drive.</div>
+            <small>Already using an attached drive for media? Leave the drive on &ldquo;keep existing&rdquo; and don't tick the format box.</small>
+          </section>
+
+          <section class="step" data-title="Apps">
+            <p class="step-intro">Pick what to install. Docker is installed automatically first if it isn't already there.</p>
+            <label class="check">
+              <input type="checkbox" id="abs" name="install_audiobookshelf" {% if cfg.apps.install_audiobookshelf %}checked{% endif %}>
+              <span>Audiobookshelf <small style="display:inline;">&mdash; audiobooks</small></span>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="cweb" name="install_calibre_web" {% if cfg.apps.install_calibre_web %}checked{% endif %}>
+              <span>Calibre-Web <small style="display:inline;">&mdash; ebooks</small></span>
+            </label>
+            <div class="opt-details" id="patron-details">
+              <div class="row">
+                <div>
+                  <label>Patron username
+                    <input name="patron_username" value="{{ cfg.apps.patron_username }}" autocomplete="off" autocapitalize="none">
+                  </label>
+                </div>
+                <div>
+                  <label>Patron password
+                    <input name="patron_password" value="{{ cfg.apps.patron_password }}" autocomplete="off" autocapitalize="none">
+                  </label>
+                </div>
+              </div>
+              <small>Setup creates this account automatically in whichever app(s) you tick, and shows it on the welcome page. You don't need to log into either app first.</small>
+            </div>
+          </section>
+
+          <section class="step" data-title="Request page">
+            <p class="step-intro">A simple page anyone on the hotspot can use to ask for a book or audiobook. Requests are saved to <code>requests.csv</code> in the media folder, with a one-tap &ldquo;mark fulfilled&rdquo;.</p>
+            <label class="check">
+              <input type="checkbox" id="requests_enabled" name="requests_enabled" data-controls="requests-details" {% if cfg.requests_page.enabled %}checked{% endif %}>
+              <span>Enable the request page</span>
+            </label>
+            <div class="opt-details" id="requests-details">
+              <label>Port
+                <input name="requests_port" value="{{ cfg.requests_page.port }}" inputmode="numeric" autocomplete="off">
               </label>
             </div>
-            <div>
-              <label>Password
-                <input name="wifi_password" value="{{ cfg.wifi.password }}" placeholder="e.g. lustybooks123"
-                       minlength="8" maxlength="63" title="8-63 characters (WPA2 requirement)">
-                <small>Must be 8-63 characters — WPA2 won't accept anything shorter.</small>
-              </label>
-            </div>
-          </div>
-          <label>Hotspot IP (wlan0)
-            <input name="wifi_ip" value="{{ cfg.wifi.ip }}" placeholder="e.g. 10.10.10.10">
-          </label>
-          <small>Automatically uses NetworkManager on newer Raspberry Pi OS, or hostapd/dhcpcd on older images.</small>
-        </fieldset>
+          </section>
 
-        <fieldset>
-          <legend>Storage</legend>
-          <label>Media root path
-            <input name="media_root" value="{{ cfg.storage.media_root }}" placeholder="e.g. /mnt/media">
-          </label>
-          <small>Subfolders like <code>audiobooks</code>, <code>books</code>, <code>config</code> will be created here.</small>
-
-          <label>Detected storage device to use (optional)
-            <select name="storage_device">
-              <option value="">-- Leave existing storage as-is --</option>
-              {% for d in devices %}
-                <option value="{{ d.path }}">{{ d.path }} ({{ d.size }}, {{ d.fstype or 'unformatted' }}, {% if d.mountpoint %}mounted at {{ d.mountpoint }}{% else %}not mounted{% endif %})</option>
-              {% endfor %}
-            </select>
-          </label>
-          <div class="checkbox-row">
-            <input type="checkbox" id="format_device" name="format_device">
-            <label for="format_device">Format selected device as ext4 and mount at {{ cfg.storage.media_root }} <strong>(⚠ erases all data on that device)</strong></label>
-          </div>
-          <small>If you're already using an attached drive for media, leave the device blank and do not check the format box.</small>
-        </fieldset>
-
-        <fieldset>
-          <legend>Apps to install</legend>
-          <div class="checkbox-row">
-            <input type="checkbox" id="abs" name="install_audiobookshelf" {% if cfg.apps.install_audiobookshelf %}checked{% endif %}>
-            <label for="abs">Install Audiobookshelf</label>
-          </div>
-          <div class="checkbox-row">
-            <input type="checkbox" id="cweb" name="install_calibre_web" {% if cfg.apps.install_calibre_web %}checked{% endif %}>
-            <label for="cweb">Install Calibre-Web</label>
-          </div>
-          <small>Docker will be installed automatically first if it isn't already present.</small>
-          <div class="row" style="margin-top:10px;">
-            <div>
-              <label>Patron account username
-                <input name="patron_username" value="{{ cfg.apps.patron_username }}">
-              </label>
-            </div>
-            <div>
-              <label>Patron account password
-                <input name="patron_password" value="{{ cfg.apps.patron_password }}">
-              </label>
-            </div>
-          </div>
-          <small>Setup creates this account automatically in Calibre-Web and/or Audiobookshelf
-          (whichever you install above) and shows it on the welcome page — you don't need to log
-          into either app yourself first.</small>
-        </fieldset>
-
-        <fieldset>
-          <legend>Book/Audiobook Requests</legend>
-          <div class="checkbox-row">
-            <input type="checkbox" id="requests_enabled" name="requests_enabled" {% if cfg.requests_page.enabled %}checked{% endif %}>
-            <label for="requests_enabled">Enable a request page for patrons</label>
-          </div>
-          <label>Port
-            <input name="requests_port" value="{{ cfg.requests_page.port }}">
-          </label>
-          <small>A simple page anyone on the hotspot can use to ask for a title. Requests are saved to
-          <code>requests.csv</code> in the media folder and shown in a table on the same page, with a
-          one-click "mark fulfilled" toggle.</small>
-        </fieldset>
-
-        <fieldset>
-          <legend>Welcome / Instructions Page</legend>
-          <small>After setup finishes, a printable welcome page is generated at
-          <code>/welcome</code> (and as a PDF at <code>/welcome.pdf</code>) with the Lusty Library
-          logo, Wi-Fi info, the patron account above, and QR codes for eBooks, Audiobooks, and
-          requests — only for the features you actually installed above.</small>
-        </fieldset>
-
-        <fieldset>
-          <legend>Auto-sync from Server (optional)</legend>
-          <div class="checkbox-row">
-            <input type="checkbox" id="enable_sync" name="enable_sync" {% if cfg.sync.enable_sync %}checked{% endif %}>
-            <label for="enable_sync">Enable auto-sync from server when Ethernet is plugged in</label>
-          </div>
-          <div class="row">
-            <div>
+          <section class="step" data-title="Auto-sync (optional)">
+            <p class="step-intro">Copy audiobooks and books from another server on your network, automatically, the moment an Ethernet cable is plugged in. Skip this if you don't need it.</p>
+            <label class="check">
+              <input type="checkbox" id="enable_sync" name="enable_sync" data-controls="sync-details" {% if cfg.sync.enable_sync %}checked{% endif %}>
+              <span>Enable auto-sync from a server</span>
+            </label>
+            <div class="opt-details" id="sync-details">
               <label>Server IP
-                <input name="server_ip" value="{{ cfg.sync.server_ip }}" placeholder="e.g. 192.168.0.139">
+                <input name="server_ip" value="{{ cfg.sync.server_ip }}" placeholder="e.g. 192.168.0.139" inputmode="decimal" autocomplete="off">
               </label>
-            </div>
-          </div>
-          <div class="row">
-            <div>
-              <label>Username <small>(leave blank for guest access)</small>
-                <input name="server_username" value="{{ cfg.sync.server_username }}" placeholder="e.g. ryan">
+              <div class="row">
+                <div>
+                  <label>Username <small style="display:inline;">(blank = guest)</small>
+                    <input name="server_username" value="{{ cfg.sync.server_username }}" placeholder="e.g. ryan" autocomplete="off" autocapitalize="none">
+                  </label>
+                </div>
+                <div>
+                  <label>Password
+                    <input type="password" name="server_password" value="{{ cfg.sync.server_password }}" placeholder="blank if guest" autocomplete="off">
+                  </label>
+                </div>
+              </div>
+              <label>Audiobooks path on server
+                <input name="server_path_audio" value="{{ cfg.sync.server_path_audio }}" placeholder="e.g. /data/media/audiobook" autocomplete="off" autocapitalize="none">
               </label>
-            </div>
-            <div>
-              <label>Password
-                <input type="password" name="server_password" value="{{ cfg.sync.server_password }}" placeholder="leave blank if guest">
+              <label>Books/Calibre path on server
+                <input name="server_path_books" value="{{ cfg.sync.server_path_books }}" placeholder="e.g. /data/media/calibre" autocomplete="off" autocapitalize="none">
               </label>
+              <small>These are paths as they exist on the server's share, for example <code>/data/media/audiobook</code>.</small>
             </div>
-          </div>
-          <label>Audiobooks path on server
-            <input name="server_path_audio" value="{{ cfg.sync.server_path_audio }}" placeholder="e.g. /data/media/audiobook">
-          </label>
-          <label>Books/Calibre path on server
-            <input name="server_path_books" value="{{ cfg.sync.server_path_books }}" placeholder="e.g. /data/media/calibre">
-          </label>
-          <small>These are the paths as they exist on the remote server share (for example <code>/data/media/audiobook</code>). Sync runs automatically the moment an Ethernet cable is plugged in — no polling.</small>
-        </fieldset>
+          </section>
 
-        <fieldset>
-          <legend>Status LEDs (optional)</legend>
-          <div class="checkbox-row">
-            <input type="checkbox" id="leds_enabled" name="leds_enabled" {% if cfg.leds.enabled %}checked{% endif %}>
-            <label for="leds_enabled">I have status LEDs wired up (Wi-Fi / Calibre-Web / Audiobookshelf)</label>
-          </div>
-          <div class="row">
-            <div>
-              <label>Wi-Fi LED (BCM pin)
-                <input name="pin_wifi" value="{{ cfg.leds.pin_wifi }}">
-              </label>
-            </div>
-            <div>
-              <label>Calibre-Web LED (BCM pin)
-                <input name="pin_cweb" value="{{ cfg.leds.pin_cweb }}">
-              </label>
-            </div>
-            <div>
-              <label>Audiobookshelf LED (BCM pin)
-                <input name="pin_abs" value="{{ cfg.leds.pin_abs }}">
-              </label>
-            </div>
-          </div>
-          <small>Each LED is tested (blink + confirm) right after the feature it indicates is installed, plus a
-          full test screen up front. The status service is installed last so it doesn't fight the test.</small>
-        </fieldset>
+          <section class="step" data-title="Hardware (optional)">
+            <p class="step-intro">Only tick these if you've actually wired them to the Pi's GPIO pins. Each one is tested for real during setup.</p>
 
-        <fieldset>
-          <legend>Shutdown button (optional)</legend>
-          <div class="checkbox-row">
-            <input type="checkbox" id="shutdown_enabled" name="shutdown_enabled" {% if cfg.shutdown_button.enabled %}checked{% endif %}>
-            <label for="shutdown_enabled">I have a shutdown button wired up</label>
-          </div>
-          <div class="row">
-            <div>
-              <label>Button (BCM pin)
-                <input name="shutdown_pin" value="{{ cfg.shutdown_button.pin }}">
-              </label>
+            <label class="check">
+              <input type="checkbox" id="leds_enabled" name="leds_enabled" data-controls="leds-details" {% if cfg.leds.enabled %}checked{% endif %}>
+              <span>Status LEDs (Wi-Fi / Calibre-Web / Audiobookshelf)</span>
+            </label>
+            <div class="opt-details" id="leds-details">
+              <div class="row">
+                <div>
+                  <label>Wi-Fi LED pin
+                    <input name="pin_wifi" value="{{ cfg.leds.pin_wifi }}" inputmode="numeric" autocomplete="off">
+                  </label>
+                </div>
+                <div>
+                  <label>Calibre-Web LED pin
+                    <input name="pin_cweb" value="{{ cfg.leds.pin_cweb }}" inputmode="numeric" autocomplete="off">
+                  </label>
+                </div>
+                <div>
+                  <label>Audiobookshelf LED pin
+                    <input name="pin_abs" value="{{ cfg.leds.pin_abs }}" inputmode="numeric" autocomplete="off">
+                  </label>
+                </div>
+              </div>
+              <small>BCM (GPIO) numbers. Each LED is held on so you can confirm it really lights up.</small>
             </div>
-            <div>
-              <label>Hold time to trigger (seconds)
-                <input name="shutdown_hold_secs" value="{{ cfg.shutdown_button.hold_secs }}">
-              </label>
-            </div>
-          </div>
-          <small>Setup will ask you to press and hold the button for real (GPIO is checked directly, not just
-          asked about) before installing the always-on watcher service.</small>
-        </fieldset>
 
-        <button type="submit" id="apply-btn">Apply &amp; Set Up</button>
-      </form>
+            <label class="check">
+              <input type="checkbox" id="shutdown_enabled" name="shutdown_enabled" data-controls="shutdown-details" {% if cfg.shutdown_button.enabled %}checked{% endif %}>
+              <span>Shutdown button (press and hold)</span>
+            </label>
+            <div class="opt-details" id="shutdown-details">
+              <div class="row">
+                <div>
+                  <label>Button pin
+                    <input name="shutdown_pin" value="{{ cfg.shutdown_button.pin }}" inputmode="numeric" autocomplete="off">
+                  </label>
+                </div>
+                <div>
+                  <label>Hold time (seconds)
+                    <input name="shutdown_hold_secs" value="{{ cfg.shutdown_button.hold_secs }}" inputmode="decimal" autocomplete="off">
+                  </label>
+                </div>
+              </div>
+              <small>Setup will ask you to press and hold the button for real before installing the always-on watcher.</small>
+            </div>
+          </section>
+
+          <section class="step" data-title="Review &amp; install">
+            <p class="step-intro">Check everything, then start. Tap <em>Edit</em> on any section to change it.</p>
+            <div id="review"></div>
+            <small>When setup finishes, a printable welcome page (also as a PDF) is generated with the logo, Wi-Fi info, the patron account and QR codes for what you installed.</small>
+          </section>
+
+          <div class="step-error" id="step-error" role="alert"></div>
+
+          <div class="nav">
+            <button type="button" class="secondary" id="back-btn">Back</button>
+            <button type="button" id="next-btn">Next</button>
+            <button type="submit" id="apply-btn" hidden>Apply &amp; Set Up</button>
+          </div>
+        </form>
+      </div>
     </div>
 
-    <div class="card">
-      <h2 style="margin-top:0;">Progress</h2>
+    <div class="card" id="progress-card" hidden>
+      <div class="progress-head">
+        <h2>Progress</h2>
+        <button type="button" class="secondary" id="edit-settings" hidden>&larr; Change settings</button>
+      </div>
+      <div id="banner"></div>
       <ul id="steps">
         {% for id, label in step_order %}
-          <li data-step="{{ id }}"><span class="badge pending">•</span><span class="label">{{ label }}</span></li>
+          <li data-step="{{ id }}"><span class="badge pending">&bull;</span><span class="label">{{ label }}</span></li>
         {% endfor %}
       </ul>
       <div id="console"></div>
@@ -2784,23 +2856,245 @@ FORM_TEMPLATE = """
   </div>
 
   <div id="confirm-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6);
-       align-items:center; justify-content:center; z-index:50;">
+       align-items:center; justify-content:center; z-index:50; padding:16px;">
     <div style="background:#1f2937; padding:24px; border-radius:16px; max-width:420px; text-align:center;">
       <p id="confirm-question" style="font-size:16px; margin-bottom:18px;"></p>
       <div style="display:flex; gap:12px; justify-content:center;">
         <button id="confirm-yes" type="button">Yes</button>
-        <button id="confirm-no" type="button" style="background:#4b5563; color:#f9fafb;">No / skip</button>
+        <button id="confirm-no" type="button" class="secondary">No / skip</button>
       </div>
     </div>
   </div>
 
 <script>
 const STEP_LABELS = {{ step_order_json|safe }};
+{% raw %}
 const badgeChar = {pending:"•", running:"…", done:"✓", error:"✕", skipped:"–"};
-let es = null;
+
+const form = document.getElementById("setup-form");
+const steps = Array.from(document.querySelectorAll(".step"));
+const segsEl = document.getElementById("segs");
+const backBtn = document.getElementById("back-btn");
+const nextBtn = document.getElementById("next-btn");
+const applyBtn = document.getElementById("apply-btn");
+const errEl = document.getElementById("step-error");
+const wizardBody = document.getElementById("wizard-body");
+const progressCard = document.getElementById("progress-card");
+const editBtn = document.getElementById("edit-settings");
+let current = 0, maxVisited = 0, es = null;
+
+const val = (n) => { const el = form.elements[n]; return el ? String(el.value).trim() : ""; };
+const on = (n) => { const el = form.elements[n]; return !!(el && el.checked); };
+const isIPv4 = (s) => /^[0-9]{1,3}([.][0-9]{1,3}){3}$/.test(s) && s.split(".").every(p => Number(p) <= 255);
+const isPin = (s) => /^[0-9]{1,2}$/.test(s) && Number(s) >= 2 && Number(s) <= 27;
+
+// ---- per-step validation (index matches the order of the <section class="step"> blocks) ----
+const validators = [
+  () => {  // Wi-Fi
+    const ssidBytes = new TextEncoder().encode(val("wifi_ssid")).length;
+    const pw = val("wifi_password");
+    if (ssidBytes < 1 || ssidBytes > 32) return "The Wi-Fi network name must be 1-32 characters.";
+    if (pw.length < 8 || pw.length > 63) return "The Wi-Fi password must be 8-63 characters (WPA2 won't accept anything shorter). Yours is " + pw.length + ".";
+    if (!isIPv4(val("wifi_ip"))) return "Enter the hotspot IP like 10.10.10.10.";
+    return "";
+  },
+  () => {  // Storage
+    if (!val("media_root").startsWith("/")) return "The media folder must be a full path starting with /, like /mnt/media.";
+    if (on("format_device") && !val("storage_device")) return "You ticked format, but no USB drive is selected. Pick a drive, or untick the format box.";
+    return "";
+  },
+  () => {  // Apps
+    if ((on("install_audiobookshelf") || on("install_calibre_web")) && (!val("patron_username") || !val("patron_password"))) {
+      return "Enter a patron username and password.";
+    }
+    return "";
+  },
+  () => {  // Request page
+    if (on("requests_enabled")) {
+      const p = Number(val("requests_port"));
+      if (!(Number.isInteger(p) && p >= 1 && p <= 65535)) return "The request page port must be a number between 1 and 65535.";
+    }
+    return "";
+  },
+  () => {  // Auto-sync
+    if (on("enable_sync")) {
+      if (!val("server_ip")) return "Enter the server's IP address, or untick auto-sync.";
+      if (!val("server_path_audio") || !val("server_path_books")) return "Enter both server paths, or untick auto-sync.";
+    }
+    return "";
+  },
+  () => {  // Hardware
+    const used = [];
+    if (on("leds_enabled")) {
+      for (const [n, label] of [["pin_wifi", "Wi-Fi LED"], ["pin_cweb", "Calibre-Web LED"], ["pin_abs", "Audiobookshelf LED"]]) {
+        if (!isPin(val(n))) return "The " + label + " pin must be a GPIO number from 2 to 27.";
+        used.push([val(n), label]);
+      }
+    }
+    if (on("shutdown_enabled")) {
+      if (!isPin(val("shutdown_pin"))) return "The shutdown button pin must be a GPIO number from 2 to 27.";
+      const secs = Number(val("shutdown_hold_secs"));
+      if (!(secs > 0 && secs <= 30)) return "The hold time must be more than 0 and at most 30 seconds.";
+      used.push([val("shutdown_pin"), "shutdown button"]);
+    }
+    const seen = {};
+    for (const [pin, label] of used) {
+      if (seen[pin]) return "GPIO" + pin + " is chosen for both the " + seen[pin] + " and the " + label + ".";
+      seen[pin] = label;
+    }
+    return "";
+  },
+  () => "",  // Review
+];
+
+// ---- wizard navigation ----
+steps.forEach((s, i) => {
+  const seg = document.createElement("span");
+  seg.className = "seg";
+  seg.setAttribute("role", "button");
+  seg.setAttribute("tabindex", "0");
+  seg.setAttribute("aria-label", "Step " + (i + 1) + ": " + s.dataset.title);
+  seg.title = s.dataset.title;
+  const go = () => { if (i <= maxVisited) jumpTo(i); };
+  seg.addEventListener("click", go);
+  seg.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+  segsEl.appendChild(seg);
+});
+
+function showErr(msg) { errEl.textContent = msg; errEl.classList.add("show"); }
+function clearErr() { errEl.textContent = ""; errEl.classList.remove("show"); }
+
+function show(i, scroll = true) {
+  current = i;
+  maxVisited = Math.max(maxVisited, i);
+  steps.forEach((s, idx) => s.classList.toggle("active", idx === i));
+  Array.from(segsEl.children).forEach((seg, idx) => {
+    seg.className = "seg" + (idx < i ? " done" : idx === i ? " current" : "") + (idx <= maxVisited ? " clickable" : "");
+  });
+  document.getElementById("step-count").textContent = "Step " + (i + 1) + " of " + steps.length;
+  document.getElementById("step-title").textContent = steps[i].dataset.title;
+  const last = i === steps.length - 1;
+  backBtn.hidden = i === 0;
+  nextBtn.hidden = last;
+  applyBtn.hidden = !last;
+  if (last) renderReview();
+  clearErr();
+  // Bring the step into view (skipping past the logo) so each Next lands on its content.
+  if (scroll) segsEl.scrollIntoView({behavior: "smooth", block: "start"});
+}
+
+function goNext() {
+  const err = validators[current]();
+  if (err) { showErr(err); return; }
+  show(current + 1);
+}
+
+function jumpTo(i) {
+  if (i === current) return;
+  if (i > current) {
+    for (let k = current; k < i; k++) {
+      const err = validators[k]();
+      if (err) { show(k); showErr(err); return; }
+    }
+  }
+  show(i);
+}
+
+backBtn.addEventListener("click", () => { if (current > 0) show(current - 1); });
+nextBtn.addEventListener("click", goNext);
+// Enter in a field means "next", never "submit the whole form from step 1".
+form.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && e.target.tagName === "INPUT" && e.target.type !== "checkbox") {
+    e.preventDefault();
+    if (current < steps.length - 1) goNext();
+  }
+});
+
+// ---- show/hide dependent fields ----
+function syncToggles() {
+  document.querySelectorAll("[data-controls]").forEach((cb) => {
+    document.getElementById(cb.dataset.controls).hidden = !cb.checked;
+  });
+  document.getElementById("patron-details").hidden = !(on("install_audiobookshelf") || on("install_calibre_web"));
+  document.getElementById("format-warning").hidden = !on("format_device");
+}
+form.addEventListener("change", syncToggles);
+syncToggles();
+
+// ---- review screen ----
+function renderReview() {
+  const dev = form.elements["storage_device"];
+  const devText = dev.value ? dev.options[dev.selectedIndex].text : "Keep existing storage as-is";
+  const yn = (b) => b ? "Yes" : "No";
+  const groups = [];
+
+  groups.push({title: "Wi-Fi hotspot", step: 0, rows: [
+    ["Network name", val("wifi_ssid")], ["Password", val("wifi_password")], ["Hotspot IP", val("wifi_ip")]]});
+
+  const storage = [["Media folder", val("media_root")], ["USB drive", devText]];
+  if (on("format_device") && dev.value) storage.push(["Format", "ERASES " + dev.value, "warn"]);
+  groups.push({title: "Storage", step: 1, rows: storage});
+
+  const apps = [["Audiobookshelf", yn(on("install_audiobookshelf"))], ["Calibre-Web", yn(on("install_calibre_web"))]];
+  if (on("install_audiobookshelf") || on("install_calibre_web")) {
+    apps.push(["Patron login", val("patron_username") + " / " + val("patron_password")]);
+  }
+  groups.push({title: "Apps", step: 2, rows: apps});
+
+  groups.push({title: "Request page", step: 3, rows: on("requests_enabled")
+    ? [["Enabled", "Yes, port " + val("requests_port")]] : [["Enabled", "No"]]});
+
+  groups.push({title: "Auto-sync", step: 4, rows: on("enable_sync") ? [
+    ["Server", val("server_ip")],
+    ["Login", val("server_username") ? val("server_username") + " / ••••" : "Guest"],
+    ["Audiobooks", val("server_path_audio")], ["Books", val("server_path_books")]] : [["Enabled", "No"]]});
+
+  const hw = [];
+  hw.push(["Status LEDs", on("leds_enabled")
+    ? "GPIO " + val("pin_wifi") + " / " + val("pin_cweb") + " / " + val("pin_abs") : "No"]);
+  hw.push(["Shutdown button", on("shutdown_enabled")
+    ? "GPIO " + val("shutdown_pin") + ", hold " + val("shutdown_hold_secs") + "s" : "No"]);
+  groups.push({title: "Hardware", step: 5, rows: hw});
+
+  const review = document.getElementById("review");
+  review.textContent = "";
+  for (const g of groups) {
+    const box = document.createElement("div");
+    box.className = "rv-group";
+    const head = document.createElement("div");
+    head.className = "rv-head";
+    const h = document.createElement("h3");
+    h.textContent = g.title;
+    const a = document.createElement("a");
+    a.href = "#";
+    a.textContent = "Edit";
+    a.addEventListener("click", (e) => { e.preventDefault(); jumpTo(g.step); });
+    head.append(h, a);
+    box.append(head);
+    for (const [k, v, cls] of g.rows) {
+      const row = document.createElement("div");
+      row.className = "rv-row" + (cls ? " " + cls : "");
+      const kk = document.createElement("span");
+      kk.textContent = k;
+      const vv = document.createElement("strong");
+      vv.textContent = v === "" ? "—" : v;
+      row.append(kk, vv);
+      box.append(row);
+    }
+    review.append(box);
+  }
+}
+
+// ---- progress / live console ----
+function showMode(mode) {
+  const progress = mode === "progress";
+  wizardBody.hidden = progress;
+  progressCard.hidden = !progress;
+  if (progress) progressCard.scrollIntoView({behavior: "smooth", block: "start"});
+}
 
 function setBadge(stepId, status) {
-  const li = document.querySelector(`li[data-step="${stepId}"]`);
+  const li = document.querySelector('li[data-step="' + stepId + '"]');
   if (!li) return;
   const badge = li.querySelector(".badge");
   badge.className = "badge " + status;
@@ -2824,7 +3118,7 @@ function showBanner(ok) {
       '<a href="/welcome" target="_blank">View the welcome page</a> &middot; ' +
       '<a href="/welcome.pdf" target="_blank">Download the printable PDF</a>';
   } else {
-    b.textContent = "Setup stopped due to an error — see the console below.";
+    b.textContent = "Setup stopped due to an error — see the console below. You can go back, change settings and try again.";
   }
 }
 
@@ -2834,12 +3128,12 @@ function showConfirm(data) {
   document.getElementById("confirm-no").textContent = data.no_label || "No / skip";
   document.getElementById("confirm-overlay").style.display = "flex";
 
-  const answer = (val) => {
+  const answer = (v) => {
     document.getElementById("confirm-overlay").style.display = "none";
     fetch("/setup/confirm", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({confirm_id: data.confirm_id, answer: val}),
+      body: JSON.stringify({confirm_id: data.confirm_id, answer: v}),
     });
   };
   document.getElementById("confirm-yes").onclick = () => answer(true);
@@ -2860,27 +3154,35 @@ function connectStream() {
     } else if (data.kind === "confirm_request") {
       showConfirm(data);
     } else if (data.kind === "done") {
-      document.getElementById("apply-btn").disabled = false;
-      document.getElementById("apply-btn").textContent = "Apply & Set Up";
+      applyBtn.disabled = false;
+      applyBtn.textContent = "Apply & Set Up";
+      editBtn.hidden = false;
       document.getElementById("confirm-overlay").style.display = "none";
       showBanner(data.ok);
     } else if (data.kind === "start") {
       document.getElementById("console").innerHTML = "";
-      document.getElementById("banner").style.display = "none";
+      document.getElementById("banner").className = "";
       document.getElementById("confirm-overlay").style.display = "none";
+      editBtn.hidden = true;
+      showMode("progress");
     }
   };
 }
 
-document.getElementById("setup-form").addEventListener("submit", async (e) => {
+editBtn.addEventListener("click", () => { showMode("edit"); show(steps.length - 1); });
+
+form.addEventListener("submit", async (e) => {
   e.preventDefault();
-  const btn = document.getElementById("apply-btn");
-  btn.disabled = true;
-  btn.textContent = "Running...";
-  document.getElementById("banner").style.display = "none";
+  for (let i = 0; i < validators.length; i++) {
+    const err = validators[i]();
+    if (err) { show(i); showErr(err); return; }
+  }
+  applyBtn.disabled = true;
+  applyBtn.textContent = "Running...";
+  document.getElementById("banner").className = "";
   Object.keys(STEP_LABELS).forEach(id => setBadge(id, "pending"));
 
-  const fd = new FormData(e.target);
+  const fd = new FormData(form);
   const payload = {};
   for (const [k, v] of fd.entries()) payload[k] = v;
   payload.format_device = fd.has("format_device");
@@ -2902,24 +3204,33 @@ document.getElementById("setup-form").addEventListener("submit", async (e) => {
   });
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({error: resp.statusText}));
-    appendLine("Failed to start: " + (err.error || resp.statusText), "line-error");
-    btn.disabled = false;
-    btn.textContent = "Apply & Set Up";
+    const msg = err.error || resp.statusText;
+    if (es) es.close();
+    applyBtn.disabled = false;
+    applyBtn.textContent = "Apply & Set Up";
+    showMode("edit");
+    show(/wi-?fi/i.test(msg) ? 0 : steps.length - 1);
+    showErr("Couldn't start: " + msg);
   }
 });
 
-// Reconnect to an in-progress run on page load/refresh.
+// First paint, and reconnect to an in-progress run on page load/refresh.
+show(0, false);
 fetch("/setup/state").then(r => r.json()).then(state => {
   Object.entries(state.steps).forEach(([id, status]) => setBadge(id, status));
   if (state.running) {
-    document.getElementById("apply-btn").disabled = true;
-    document.getElementById("apply-btn").textContent = "Running...";
+    applyBtn.disabled = true;
+    applyBtn.textContent = "Running...";
+    showMode("progress");
     connectStream();
     if (state.pending_confirm) showConfirm(state.pending_confirm);
   } else if (state.finished) {
+    showMode("progress");
+    editBtn.hidden = false;
     showBanner(state.ok);
   }
 });
+{% endraw %}
 </script>
 </body>
 </html>
@@ -2943,7 +3254,7 @@ def setup():
         board=board,
         step_order=STEP_ORDER,
         step_order_json=json.dumps({sid: label for sid, label in STEP_ORDER}),
-        logo_data_uri=LOGO_DATA_URI,
+        logo_data_uri=LOGO_ON_DARK_DATA_URI,
         favicon_data_uri=FAVICON_DATA_URI,
     )
 
