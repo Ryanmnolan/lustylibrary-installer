@@ -9,7 +9,7 @@
 #   sudo bash uninstall.sh --purge-data    # same, but also wipe books/audiobooks/config/welcome page
 #   sudo bash uninstall.sh --full          # remove EVERYTHING the installer added: all of the above,
 #                                          #   the library data, the Docker images AND Docker Engine,
-#                                          #   hostapd/dnsmasq/cifs-utils/GPIO packages, pip packages,
+#                                          #   hostapd/dnsmasq/cifs-utils/smbclient/GPIO packages, pip packages,
 #                                          #   the USB-drive mount, and the hotspot config
 #   sudo bash uninstall.sh --full --yes    # same, without the "are you sure" prompt
 #
@@ -65,7 +65,7 @@ main() {
     echo "--full will remove EVERYTHING the Lusty Library installer added, including:"
     echo "  - all books, audiobooks and library config"
     echo "  - Docker Engine, its images, containers and volumes (ALL of Docker, not just Lusty Library's)"
-    echo "  - hostapd, dnsmasq, cifs-utils and the GPIO/QR Python packages"
+    echo "  - hostapd, dnsmasq, cifs-utils, smbclient and the GPIO/QR Python packages"
     echo
     answer=""
     # /dev/tty (not stdin) so this still works when piped from curl | sudo bash.
@@ -188,15 +188,17 @@ PYEOF
   # 4. Remove the sync trigger hook, script and credentials
   # -------------------------------------------------------------------------
   step "Removing the auto-sync trigger"
-  if mountpoint -q /mnt/remote_data 2>/dev/null; then
-    umount /mnt/remote_data >/dev/null 2>&1 && note "Unmounted /mnt/remote_data."
-  fi
+  for point in /mnt/remote_audio /mnt/remote_books /mnt/remote_data; do
+    if mountpoint -q "$point" 2>/dev/null; then
+      umount "$point" >/dev/null 2>&1 && note "Unmounted $point."
+    fi
+  done
   rm -f /etc/NetworkManager/dispatcher.d/99-lustylibrary-sync
   rm -f /etc/udev/rules.d/99-lustylibrary-sync.rules
   rm -f /etc/lustylibrary-sync-credentials
   rm -f /usr/local/bin/sync_from_server.sh
   rm -f /run/sync_from_server.lock
-  rmdir /mnt/remote_data >/dev/null 2>&1 || true
+  rmdir /mnt/remote_audio /mnt/remote_books /mnt/remote_data >/dev/null 2>&1 || true
   udevadm control --reload-rules >/dev/null 2>&1 || true
 
   # -------------------------------------------------------------------------
@@ -264,7 +266,7 @@ PYEOF
     note "Left requests / pyyaml / Pillow alone — the OS can depend on those."
 
     step "Removing system packages the installer added"
-    purge_pkgs hostapd dnsmasq cifs-utils python3-gpiozero python3-rpi-lgpio
+    purge_pkgs hostapd dnsmasq cifs-utils smbclient python3-gpiozero python3-rpi-lgpio
 
     step "Removing Docker Engine"
     if command -v docker >/dev/null 2>&1; then

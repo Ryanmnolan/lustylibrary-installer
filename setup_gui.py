@@ -18,9 +18,12 @@ import itertools
 import json
 import os
 import platform
+import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -173,8 +176,12 @@ DEFAULT_CONFIG = {
         "server_ip": "",
         "server_username": "",
         "server_password": "",
-        "server_path_audio": "/data/media/audiobook",
-        "server_path_books": "/data/media/calibre",
+        # Chosen with the folder browser on the Auto-sync step: the share on the
+        # server, and the folder inside that share, for each of the two folders.
+        "server_share_audio": "",
+        "server_path_audio": "",
+        "server_share_books": "",
+        "server_path_books": "",
     },
     "leds": {
         "enabled": False,
@@ -1245,17 +1252,236 @@ def detect_ethernet_iface():
     return candidates[0] if candidates else "eth0"
 
 
+# ---------------------------------------------------------------------------
+# SMB folder browsing (the picker on the Auto-sync step)
+#
+# Lists the shares on a server, and the folders inside a share, by running
+# smbclient. Nothing is mounted. Every value that ends up in a smbclient
+# command or in the generated sync script is validated first: smbclient's -c
+# option runs ';'-separated commands, so a quote or ';' in a path must never
+# get through.
+# ---------------------------------------------------------------------------
+
+SMB_TIMEOUT_SECONDS = 25
+SMB_INSTALL_TIMEOUT_SECONDS = 300
+SMB_SKIP_FOLDERS = {"$recycle.bin", "system volume information", "@eadir", "lost+found", "__macosx", "#recycle"}
+_SMB_HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+# Characters that must never reach a smbclient command or the sync script:
+# quotes and ';' (command separators), backslash, wildcards, and control chars.
+_SMB_BAD_CHARS = frozenset('";*?<>|' + chr(92))
+
+
+class _SmbNameBad:
+    @staticmethod
+    def search(text):
+        return any(c in _SMB_BAD_CHARS or ord(c) < 32 for c in text)
+
+
+_SMB_NAME_BAD = _SmbNameBad()
+_SMB_LS_RE = re.compile(
+    r"^\s{2}(?P<name>.+?)\s+(?P<attr>[A-Za-z]+)\s+(?P<size>[0-9]+)\s+"
+    r"[A-Za-z]{3}\s+[A-Za-z]{3}\s+[0-9]+\s+[0-9]{2}:[0-9]{2}:[0-9]{2}\s+[0-9]{4}\s*$"
+)
+_SMBCLIENT_LOCK = threading.Lock()
+
+
+def smb_clean_host(host):
+    host = str(host or "").strip()
+    if not _SMB_HOST_RE.match(host):
+        raise ValueError("Enter the server as an IP address (like 192.168.0.50) or a name (like tower).")
+    return host
+
+
+def smb_clean_share(share):
+    share = str(share or "").strip()
+    if not share:
+        raise ValueError("Choose a share on the server first.")
+    if len(share) > 80 or "/" in share or _SMB_NAME_BAD.search(share) or share.upper() == "IPC$":
+        raise ValueError(f"'{share}' isn't a share name this tool can use.")
+    return share
+
+
+def smb_clean_path(path):
+    """'/media//audiobook/' -> ['media', 'audiobook']. Raises ValueError for
+    anything that could change what a smbclient command does."""
+    parts = []
+    for part in str(path or "").split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise ValueError("A folder path can't contain '..'.")
+        if _SMB_NAME_BAD.search(part):
+            raise ValueError(f"The folder name '{part}' has a character this tool can't handle (a quote, backslash, semicolon or wildcard).")
+        parts.append(part)
+    return parts
+
+
+def _smb_clean_login(value, label):
+    value = str(value or "")
+    if any(c in value for c in "\r\n\x00"):
+        raise ValueError(f"The {label} can't contain line breaks.")
+    return value
+
+
+def ensure_smbclient():
+    """None if smbclient is available (installing it first if it's missing),
+    otherwise a plain-language problem description."""
+    if shutil.which("smbclient"):
+        return None
+    with _SMBCLIENT_LOCK:
+        if shutil.which("smbclient"):
+            return None
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            return "The folder browser needs a small tool (smbclient) that isn't installed, and setup isn't running as root. Run: sudo apt-get install -y smbclient"
+        env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+        last = ""
+        for attempt in range(2):
+            if attempt == 1:  # package lists can be stale on a fresh image
+                subprocess.run(["apt-get", "update"], capture_output=True, text=True, env=env, timeout=SMB_INSTALL_TIMEOUT_SECONDS)
+            try:
+                proc = subprocess.run(
+                    ["apt-get", "install", "-y", "smbclient"],
+                    capture_output=True, text=True, env=env, timeout=SMB_INSTALL_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                return "Installing the folder-browser tool took too long. Check the Pi's internet connection and try again."
+            if proc.returncode == 0 and shutil.which("smbclient"):
+                return None
+            last = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:] or [""]
+            last = last[0]
+        return f"Couldn't install the folder-browser tool (the Pi needs internet for this once). {last}".strip()
+
+
+def start_smbclient_install_async():
+    """Called as soon as auto-sync is ticked, so the tool is usually installed
+    by the time the user taps Browse."""
+    if shutil.which("smbclient"):
+        return
+    threading.Thread(target=ensure_smbclient, daemon=True).start()
+
+
+def run_smbclient(server, username, password, share=None, command=None):
+    """Runs smbclient and returns (returncode, stdout, stderr). Credentials
+    go in a private temp file, never on the command line. Raises
+    subprocess.TimeoutExpired if the server doesn't answer in time."""
+    args = ["smbclient"]
+    args += ["-L", server, "-g"] if share is None else [f"//{server}/{share}"]
+    auth_path = None
+    try:
+        if username:
+            fd, auth_path = tempfile.mkstemp(prefix="lusty-smb-")
+            os.chmod(auth_path, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(f"username = {username}\npassword = {password}\n")
+            args += ["-A", auth_path]
+        else:
+            args += ["-N"]
+        if command:
+            args += ["-c", command]
+        proc = subprocess.run(
+            args, capture_output=True, text=True, timeout=SMB_TIMEOUT_SECONDS,
+            env=dict(os.environ, LC_ALL="C"),
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    finally:
+        if auth_path:
+            try:
+                os.unlink(auth_path)
+            except OSError:
+                pass
+
+
+_SMB_ERRORS = [
+    ("NT_STATUS_LOGON_FAILURE", "The server rejected that username or password."),
+    ("NT_STATUS_WRONG_PASSWORD", "The server rejected that username or password."),
+    ("NT_STATUS_ACCOUNT_DISABLED", "That account is disabled on the server."),
+    ("NT_STATUS_PASSWORD_EXPIRED", "That account's password has expired on the server."),
+    ("NT_STATUS_ACCESS_DENIED", "Access denied. That login isn't allowed to open this (guest access may be turned off — try entering a username and password)."),
+    ("NT_STATUS_BAD_NETWORK_NAME", "The server doesn't have a share with that name."),
+    ("NT_STATUS_OBJECT_NAME_NOT_FOUND", "That folder doesn't exist any more (it may have been renamed)."),
+    ("NT_STATUS_OBJECT_PATH_NOT_FOUND", "That folder doesn't exist any more (it may have been renamed)."),
+    ("NT_STATUS_NO_SUCH_FILE", "That folder doesn't exist any more (it may have been renamed)."),
+    ("NT_STATUS_NOT_A_DIRECTORY", "That isn't a folder."),
+    ("NT_STATUS_HOST_UNREACHABLE", "Couldn't reach the server. Check the IP address and that it's on the same network as this Pi."),
+    ("NT_STATUS_NETWORK_UNREACHABLE", "Couldn't reach the server. Check the IP address and that it's on the same network as this Pi."),
+    ("NT_STATUS_CONNECTION_REFUSED", "The server refused the connection. Is file sharing (SMB) turned on there?"),
+    ("NT_STATUS_IO_TIMEOUT", "The server didn't answer in time. Check the IP address and that it's switched on."),
+    ("NT_STATUS_CONNECTION_DISCONNECTED", "The server dropped the connection. Try again."),
+    ("NT_STATUS_UNSUCCESSFUL", "Couldn't connect to the server. Check the IP address and that file sharing (SMB) is on."),
+    ("NT_STATUS_RESOURCE_NAME_NOT_FOUND", "Couldn't find that server. Check the IP address or name."),
+    ("NT_STATUS_PROTOCOL_NOT_SUPPORTED", "The server and this Pi couldn't agree on an SMB version."),
+]
+
+
+def smb_friendly_error(stdout, stderr):
+    text = f"{stderr}\n{stdout}"
+    for needle, message in _SMB_ERRORS:
+        if needle in text:
+            return message
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return "The server said: " + (lines[-1] if lines else "no details given")
+
+
+def smb_browse(server, username, password, share, parts):
+    """With no share: returns ({'shares': [...]}, None). With a share: returns
+    ({'folders': [...], 'files': n, 'path': '/a/b'}, None). On failure
+    returns (None, plain-language message)."""
+    try:
+        if not share:
+            rc, out, err = run_smbclient(server, username, password)
+            shares = []
+            for line in out.splitlines():
+                kind, _, rest = line.partition("|")
+                name = rest.partition("|")[0]
+                if kind == "Disk" and name and not name.endswith("$"):
+                    shares.append(name)
+            if rc != 0 and not shares:
+                return None, smb_friendly_error(out, err)
+            return {"shares": sorted(set(shares), key=str.lower)}, None
+
+        command = "ls" if not parts else 'ls "' + "/".join(parts) + '/*"'
+        rc, out, err = run_smbclient(server, username, password, share=share, command=command)
+    except subprocess.TimeoutExpired:
+        return None, "The server took too long to answer. Check the IP address and that it's switched on."
+    except OSError as e:
+        return None, f"Couldn't run the folder-browser tool: {e}"
+
+    folders, files = [], 0
+    for line in out.splitlines():
+        m = _SMB_LS_RE.match(line)
+        if not m:
+            continue
+        name, attr = m.group("name"), m.group("attr")
+        if name in (".", ".."):
+            continue
+        if "D" in attr:
+            if name.startswith(".") or name.lower() in SMB_SKIP_FOLDERS:
+                continue
+            folders.append({"name": name, "ok": not _SMB_NAME_BAD.search(name)})
+        else:
+            files += 1
+    if rc != 0 and not folders and not files:
+        return None, smb_friendly_error(out, err)
+    folders.sort(key=lambda f: f["name"].lower())
+    return {"folders": folders, "files": files, "path": "/" + "/".join(parts)}, None
+
+
 def apply_sync_config(cfg, step_id):
     if not cfg["sync"]["enable_sync"]:
         log_line(step_id, "Auto-sync disabled, skipping.")
         return
 
     media_root = cfg["storage"]["media_root"]
-    server_ip = cfg["sync"]["server_ip"]
     username = (cfg["sync"].get("server_username") or "").strip()
     password = cfg["sync"].get("server_password") or ""
-    path_audio = cfg["sync"]["server_path_audio"]
-    path_books = cfg["sync"]["server_path_books"]
+    try:
+        server_ip = smb_clean_host(cfg["sync"]["server_ip"])
+        share_audio = smb_clean_share(cfg["sync"]["server_share_audio"])
+        share_books = smb_clean_share(cfg["sync"]["server_share_books"])
+        path_audio = "/" + "/".join(smb_clean_path(cfg["sync"]["server_path_audio"]))
+        path_books = "/" + "/".join(smb_clean_path(cfg["sync"]["server_path_books"]))
+    except ValueError as e:
+        raise StepFailed(f"Auto-sync settings are incomplete: {e}")
     eth_iface = detect_ethernet_iface()
     log_line(step_id, f"Detected wired interface: {eth_iface}")
 
@@ -1275,18 +1501,23 @@ def apply_sync_config(cfg, step_id):
             SYNC_CREDENTIALS_PATH.unlink()
         cifs_opts = "guest,vers=3.0,iocharset=utf8,noperm,uid=1000,gid=1000"
 
+    q = shlex.quote
+    # Audiobooks and books can live in different shares on the server, so each
+    # gets its own mount. Values are validated above and shell-quoted here.
     script = f"""#!/bin/bash
 set -euo pipefail
 
-SERVER_IP="{server_ip}"
-SERVER_SHARE="//{server_ip}/data"
-MOUNT_POINT="/mnt/remote_data"
+SERVER_IP={q(server_ip)}
+SHARE_AUDIO={q(f"//{server_ip}/{share_audio}")}
+SHARE_BOOKS={q(f"//{server_ip}/{share_books}")}
+MOUNT_AUDIO="/mnt/remote_audio"
+MOUNT_BOOKS="/mnt/remote_books"
 
-SRC_AUDIO="${{MOUNT_POINT}}{path_audio}"
-SRC_BOOKS="${{MOUNT_POINT}}{path_books}"
+SRC_AUDIO="${{MOUNT_AUDIO}}"{q(path_audio)}
+SRC_BOOKS="${{MOUNT_BOOKS}}"{q(path_books)}
 
-DST_AUDIO="{media_root}/audiobooks/"
-DST_BOOKS="{media_root}/books/"
+DST_AUDIO={q(media_root.rstrip("/") + "/audiobooks/")}
+DST_BOOKS={q(media_root.rstrip("/") + "/books/")}
 
 CIFS_OPTS="{cifs_opts}"
 
@@ -1314,28 +1545,40 @@ flock -n 9 || exit 0
     sleep 3
   done
 
-  if ! mountpoint -q "$MOUNT_POINT"; then
-    echo "Mounting $SERVER_SHARE -> $MOUNT_POINT"
-    mkdir -p "$MOUNT_POINT"
-    mount -t cifs "$SERVER_SHARE" "$MOUNT_POINT" -o "$CIFS_OPTS" || {{
-      echo "ERROR: mount failed"
-      rm -f "$FLAG"
-      exit 0
-    }}
+  mount_share() {{
+    local share="$1" point="$2"
+    if ! mountpoint -q "$point"; then
+      echo "Mounting $share -> $point"
+      mkdir -p "$point"
+      mount -t cifs "$share" "$point" -o "$CIFS_OPTS" || return 1
+    fi
+  }}
+
+  unmount_all() {{
+    for point in "$MOUNT_AUDIO" "$MOUNT_BOOKS"; do
+      if mountpoint -q "$point"; then
+        echo "Unmounting $point"
+        umount "$point" || true
+      fi
+    done
+  }}
+
+  if ! mount_share "$SHARE_AUDIO" "$MOUNT_AUDIO" || ! mount_share "$SHARE_BOOKS" "$MOUNT_BOOKS"; then
+    echo "ERROR: mount failed"
+    unmount_all
+    rm -f "$FLAG"
+    exit 0
   fi
 
   mkdir -p "$DST_AUDIO" "$DST_BOOKS"
 
   echo "Syncing audiobooks..."
-  rsync -av --ignore-existing "$SRC_AUDIO" "$DST_AUDIO" || true
+  rsync -av --ignore-existing "${{SRC_AUDIO%/}}/" "$DST_AUDIO" || true
 
   echo "Syncing books..."
-  rsync -av --ignore-existing "$SRC_BOOKS" "$DST_BOOKS" || true
+  rsync -av --ignore-existing "${{SRC_BOOKS%/}}/" "$DST_BOOKS" || true
 
-  if mountpoint -q "$MOUNT_POINT"; then
-    echo "Unmounting $MOUNT_POINT"
-    umount "$MOUNT_POINT" || true
-  fi
+  unmount_all
 
   rm -f "$FLAG"
   echo "==== $(date '+%F %T') — sync done ===="
@@ -2617,6 +2860,45 @@ FORM_TEMPLATE = """
     .nav { display:flex; gap:12px; margin-top:20px; }
     .nav button { flex:1; padding:14px 18px; }
 
+    .picker-label { margin-top:14px; font-size:15px; }
+    .picker { display:flex; justify-content:space-between; align-items:center; gap:10px; width:100%; margin-top:6px;
+              padding:14px; background:#030712; color:#e5e7eb; border:1px solid #4b5563; border-radius:8px;
+              font-size:16px; font-weight:400; text-align:left; }
+    .picker:hover:not(:disabled) { background:#0b1220; }
+    .picker .picker-text { word-break:break-word; }
+    .picker .picker-text.empty { color:var(--muted); }
+    .picker .picker-go { color:#6ee7b7; font-weight:600; flex-shrink:0; }
+
+    #browse-overlay { position:fixed; inset:0; background:rgba(0,0,0,.7); display:flex; align-items:center;
+                      justify-content:center; padding:12px; z-index:60; }
+    .browse-box { background:var(--card); border-radius:16px; width:100%; max-width:520px; max-height:88vh;
+                  display:flex; flex-direction:column; padding:18px; box-shadow:0 10px 40px rgba(0,0,0,.6); }
+    .br-head { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px; }
+    .br-head h3 { font-size:17px; }
+    .br-head button { padding:6px 12px; font-size:15px; }
+    .br-crumbs { display:flex; flex-wrap:wrap; align-items:center; gap:2px 6px; font-size:14px; margin-bottom:8px; color:var(--muted); }
+    .br-crumbs a { color:#6ee7b7; text-decoration:none; word-break:break-all; }
+    .br-crumbs a:hover { text-decoration:underline; }
+    .br-crumbs .cur { color:#f9fafb; font-weight:600; word-break:break-all; }
+    .br-status { font-size:14px; color:var(--muted); min-height:20px; margin-bottom:6px; line-height:1.45; }
+    .br-status.err { color:#fca5a5; }
+    .br-status button { padding:4px 12px; font-size:13px; margin-left:8px; }
+    .br-list { flex:1 1 auto; min-height:80px; overflow-y:auto; border:1px solid var(--line); border-radius:10px; background:#030712; }
+    .br-list:empty { display:none; }
+    .br-row { display:flex; justify-content:space-between; align-items:center; gap:10px; width:100%; padding:14px; margin:0;
+              background:transparent; color:#e5e7eb; border:0; border-bottom:1px solid var(--line); border-radius:0;
+              font-size:16px; font-weight:400; text-align:left; }
+    .br-row:last-child { border-bottom:0; }
+    .br-row:hover:not(:disabled) { background:#111827; }
+    .br-row:disabled { color:#6b7280; cursor:not-allowed; }
+    .br-row .name { word-break:break-word; }
+    .br-row .go { color:#6ee7b7; flex-shrink:0; }
+    .br-manual { margin-top:10px; }
+    .br-manual .row { align-items:flex-end; }
+    .br-manual button { padding:12px 18px; }
+    .br-foot { display:flex; gap:12px; margin-top:14px; }
+    .br-foot button { flex:1; padding:13px 16px; }
+
     .rv-group { background:#030712; border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin-top:12px; }
     .rv-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
     .rv-head a { color:#6ee7b7; font-size:14px; }
@@ -2743,7 +3025,7 @@ FORM_TEMPLATE = """
           </section>
 
           <section class="step" data-title="Auto-sync (optional)">
-            <p class="step-intro">Copy audiobooks and books from another server on your network, automatically, the moment an Ethernet cable is plugged in. Skip this if you don't need it.</p>
+            <p class="step-intro">Copy audiobooks and books from another computer or NAS on your network, automatically, the moment an Ethernet cable is plugged in. Skip this if you don't need it.</p>
             <label class="check">
               <input type="checkbox" id="enable_sync" name="enable_sync" data-controls="sync-details" {% if cfg.sync.enable_sync %}checked{% endif %}>
               <span>Enable auto-sync from a server</span>
@@ -2764,13 +3046,16 @@ FORM_TEMPLATE = """
                   </label>
                 </div>
               </div>
-              <label>Audiobooks path on server
-                <input name="server_path_audio" value="{{ cfg.sync.server_path_audio }}" placeholder="e.g. /data/media/audiobook" autocomplete="off" autocapitalize="none">
-              </label>
-              <label>Books/Calibre path on server
-                <input name="server_path_books" value="{{ cfg.sync.server_path_books }}" placeholder="e.g. /data/media/calibre" autocomplete="off" autocapitalize="none">
-              </label>
-              <small>These are paths as they exist on the server's share, for example <code>/data/media/audiobook</code>.</small>
+              <div class="picker-label">Audiobooks folder on the server</div>
+              <button type="button" class="picker" id="pick-audio" data-kind="audio"><span class="picker-text"></span><span class="picker-go">Browse</span></button>
+              <input type="hidden" name="server_share_audio" value="{{ cfg.sync.server_share_audio }}">
+              <input type="hidden" name="server_path_audio" value="{{ cfg.sync.server_path_audio }}">
+
+              <div class="picker-label">Books (Calibre) folder on the server</div>
+              <button type="button" class="picker" id="pick-books" data-kind="books"><span class="picker-text"></span><span class="picker-go">Browse</span></button>
+              <input type="hidden" name="server_share_books" value="{{ cfg.sync.server_share_books }}">
+              <input type="hidden" name="server_path_books" value="{{ cfg.sync.server_path_books }}">
+              <small>Tap Browse to look through the server and pick each folder. Nothing is copied until a cable is plugged in.</small>
             </div>
           </section>
 
@@ -2855,6 +3140,29 @@ FORM_TEMPLATE = """
     </div>
   </div>
 
+  <div id="browse-overlay" hidden>
+    <div class="browse-box" role="dialog" aria-modal="true" aria-labelledby="br-title">
+      <div class="br-head">
+        <h3 id="br-title">Choose a folder</h3>
+        <button type="button" class="secondary" id="br-close" aria-label="Close">&#10005;</button>
+      </div>
+      <div class="br-crumbs" id="br-crumbs"></div>
+      <div class="br-status" id="br-status"></div>
+      <div class="br-list" id="br-list"></div>
+      <div class="br-manual" id="br-manual" hidden>
+        <small style="margin-top:0;">Don't see your share? Type its name:</small>
+        <div class="row">
+          <div><input id="br-share-input" placeholder="e.g. media" autocomplete="off" autocapitalize="none" style="margin-top:6px;"></div>
+          <div style="flex:0 0 auto;"><button type="button" class="secondary" id="br-share-go">Open</button></div>
+        </div>
+      </div>
+      <div class="br-foot">
+        <button type="button" class="secondary" id="br-cancel">Cancel</button>
+        <button type="button" id="br-use" disabled>Use this folder</button>
+      </div>
+    </div>
+  </div>
+
   <div id="confirm-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6);
        align-items:center; justify-content:center; z-index:50; padding:16px;">
     <div style="background:#1f2937; padding:24px; border-radius:16px; max-width:420px; text-align:center;">
@@ -2919,7 +3227,9 @@ const validators = [
   () => {  // Auto-sync
     if (on("enable_sync")) {
       if (!val("server_ip")) return "Enter the server's IP address, or untick auto-sync.";
-      if (!val("server_path_audio") || !val("server_path_books")) return "Enter both server paths, or untick auto-sync.";
+      if (!val("server_share_audio") || !val("server_share_books")) {
+        return "Tap Browse to pick the audiobooks folder and the books folder on the server, or untick auto-sync.";
+      }
     }
     return "";
   },
@@ -3021,6 +3331,182 @@ function syncToggles() {
 form.addEventListener("change", syncToggles);
 syncToggles();
 
+// ---- server folder picker (Auto-sync step) ----
+const BR_TITLES = {audio: "Choose the audiobooks folder", books: "Choose the books folder"};
+let br = null;
+let prepared = false;
+
+function formatLoc(share, path) {
+  if (!share) return "—";
+  return [share].concat(String(path || "").split("/").filter(Boolean)).join(" › ");
+}
+
+function renderPickers() {
+  for (const kind of ["audio", "books"]) {
+    const share = val("server_share_" + kind);
+    const el = document.querySelector("#pick-" + kind + " .picker-text");
+    el.textContent = share ? formatLoc(share, val("server_path_" + kind)) : "Choose a folder…";
+    el.classList.toggle("empty", !share);
+  }
+}
+
+const brEl = (id) => document.getElementById(id);
+
+function closeBrowser() {
+  if (br) br.token++;
+  br = null;
+  brEl("browse-overlay").hidden = true;
+}
+
+function openBrowser(kind) {
+  const server = val("server_ip");
+  if (!/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(server)) {
+    showErr("Enter the server's IP address first, then tap Browse.");
+    return;
+  }
+  clearErr();
+  br = {kind: kind, share: val("server_share_" + kind), parts: String(val("server_path_" + kind)).split("/").filter(Boolean), token: 0};
+  brEl("br-title").textContent = BR_TITLES[kind];
+  brEl("browse-overlay").hidden = false;
+  loadBrowser();
+}
+
+function brStatus(text, isErr, retry) {
+  const s = brEl("br-status");
+  s.textContent = text;
+  s.classList.toggle("err", !!isErr);
+  if (retry) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "secondary";
+    b.textContent = "Try again";
+    b.addEventListener("click", loadBrowser);
+    s.appendChild(b);
+  }
+}
+
+function brCrumbs() {
+  const box = brEl("br-crumbs");
+  box.textContent = "";
+  const add = (label, onClick, current) => {
+    if (box.childNodes.length) { const sep = document.createElement("span"); sep.textContent = "›"; box.appendChild(sep); }
+    if (current) {
+      const c = document.createElement("span"); c.className = "cur"; c.textContent = label; box.appendChild(c);
+    } else {
+      const a = document.createElement("a"); a.href = "#"; a.textContent = label;
+      a.addEventListener("click", (e) => { e.preventDefault(); onClick(); });
+      box.appendChild(a);
+    }
+  };
+  add(val("server_ip"), () => { br.share = ""; br.parts = []; loadBrowser(); }, !br.share);
+  if (br.share) {
+    add(br.share, () => { br.parts = []; loadBrowser(); }, br.parts.length === 0);
+    br.parts.forEach((name, i) => {
+      add(name, () => { br.parts = br.parts.slice(0, i + 1); loadBrowser(); }, i === br.parts.length - 1);
+    });
+  }
+}
+
+async function loadBrowser() {
+  const my = ++br.token;
+  brCrumbs();
+  brEl("br-list").textContent = "";
+  brEl("br-manual").hidden = true;
+  brEl("br-use").disabled = true;
+  brEl("br-use").textContent = br.share && br.parts.length === 0 ? "Use whole share" : "Use this folder";
+  brStatus("Connecting to the server…");
+  const slow = setTimeout(() => {
+    if (br && br.token === my) brStatus("Still working… the first time, a small tool is installed on the Pi, which can take a minute.");
+  }, 4000);
+  try {
+    const resp = await fetch("/setup/browse", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        server: val("server_ip"), username: val("server_username"), password: form.elements["server_password"].value,
+        share: br.share, path: "/" + br.parts.join("/"),
+      }),
+    });
+    const data = await resp.json().catch(() => ({error: "Unexpected reply from the Pi."}));
+    clearTimeout(slow);
+    if (!br || br.token !== my) return;
+    if (!resp.ok) {
+      brStatus(data.error || "Something went wrong.", true, true);
+      brEl("br-manual").hidden = !!br.share;   // can't list shares? let them type one
+      return;
+    }
+    renderBrowser(data);
+  } catch (e) {
+    clearTimeout(slow);
+    if (br && br.token === my) brStatus("Couldn't reach the setup service on the Pi.", true, true);
+  }
+}
+
+function renderBrowser(data) {
+  const list = brEl("br-list");
+  list.textContent = "";
+  const row = (label, enabled, onClick) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "br-row";
+    b.disabled = !enabled;
+    const n = document.createElement("span"); n.className = "name"; n.textContent = label;
+    const g = document.createElement("span"); g.className = "go"; g.textContent = enabled ? "›" : "";
+    b.append(n, g);
+    if (enabled) b.addEventListener("click", onClick);
+    list.appendChild(b);
+  };
+  if (!br.share) {
+    brEl("br-manual").hidden = false;
+    brEl("br-share-input").value = "";
+    if (data.shares.length === 0) brStatus("No shares were listed. If you know the share's name, type it below.");
+    else brStatus("Shares on this server — tap one to look inside:");
+    data.shares.forEach((s) => row(s, true, () => { br.share = s; br.parts = []; loadBrowser(); }));
+    return;
+  }
+  brEl("br-use").disabled = false;
+  data.folders.forEach((f) => row(f.ok ? f.name : f.name + "  (name not supported)", f.ok, () => { br.parts.push(f.name); loadBrowser(); }));
+  const files = data.files === 1 ? "1 file" : data.files + " files";
+  const folders = data.folders.length === 0 ? "no folders" : (data.folders.length === 1 ? "1 folder" : data.folders.length + " folders");
+  brStatus("Here: " + files + ", " + folders + ".");
+}
+
+function useBrowserFolder() {
+  if (!br || !br.share) return;
+  form.elements["server_share_" + br.kind].value = br.share;
+  form.elements["server_path_" + br.kind].value = "/" + br.parts.join("/");
+  renderPickers();
+  closeBrowser();
+}
+
+document.getElementById("pick-audio").addEventListener("click", () => openBrowser("audio"));
+document.getElementById("pick-books").addEventListener("click", () => openBrowser("books"));
+brEl("br-close").addEventListener("click", closeBrowser);
+brEl("br-cancel").addEventListener("click", closeBrowser);
+brEl("br-use").addEventListener("click", useBrowserFolder);
+brEl("br-share-go").addEventListener("click", () => {
+  const name = brEl("br-share-input").value.trim();
+  if (name && br) { br.share = name; br.parts = []; loadBrowser(); }
+});
+brEl("br-share-input").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); brEl("br-share-go").click(); } });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && br) closeBrowser(); });
+// A different server means the earlier folder choices no longer apply.
+form.elements["server_ip"].addEventListener("change", () => {
+  for (const kind of ["audio", "books"]) {
+    form.elements["server_share_" + kind].value = "";
+    form.elements["server_path_" + kind].value = "";
+  }
+  renderPickers();
+});
+// Start installing the browsing tool in the background as soon as sync is switched on.
+form.elements["enable_sync"].addEventListener("change", () => {
+  if (on("enable_sync") && !prepared) {
+    prepared = true;
+    fetch("/setup/browse/prepare", {method: "POST"}).catch(() => {});
+  }
+});
+renderPickers();
+
 // ---- review screen ----
 function renderReview() {
   const dev = form.elements["storage_device"];
@@ -3047,7 +3533,8 @@ function renderReview() {
   groups.push({title: "Auto-sync", step: 4, rows: on("enable_sync") ? [
     ["Server", val("server_ip")],
     ["Login", val("server_username") ? val("server_username") + " / ••••" : "Guest"],
-    ["Audiobooks", val("server_path_audio")], ["Books", val("server_path_books")]] : [["Enabled", "No"]]});
+    ["Audiobooks", formatLoc(val("server_share_audio"), val("server_path_audio"))],
+    ["Books", formatLoc(val("server_share_books"), val("server_path_books"))]] : [["Enabled", "No"]]});
 
   const hw = [];
   hw.push(["Status LEDs", on("leds_enabled")
@@ -3295,8 +3782,20 @@ def setup_apply():
     cfg["sync"]["server_ip"] = (data.get("server_ip") or "").strip() or cfg["sync"]["server_ip"]
     cfg["sync"]["server_username"] = (data.get("server_username") or "").strip()
     cfg["sync"]["server_password"] = data.get("server_password") or ""
-    cfg["sync"]["server_path_audio"] = (data.get("server_path_audio") or "").strip() or cfg["sync"]["server_path_audio"]
-    cfg["sync"]["server_path_books"] = (data.get("server_path_books") or "").strip() or cfg["sync"]["server_path_books"]
+    for kind in ("audio", "books"):
+        for field in (f"server_share_{kind}", f"server_path_{kind}"):
+            cfg["sync"][field] = (data.get(field) or "").strip() or cfg["sync"][field]
+
+    if cfg["sync"]["enable_sync"]:
+        # Same checks the folder browser uses: nothing unvalidated may reach
+        # the sync script that runs as root.
+        try:
+            cfg["sync"]["server_ip"] = smb_clean_host(cfg["sync"]["server_ip"])
+            for kind in ("audio", "books"):
+                cfg["sync"][f"server_share_{kind}"] = smb_clean_share(cfg["sync"][f"server_share_{kind}"])
+                cfg["sync"][f"server_path_{kind}"] = "/" + "/".join(smb_clean_path(cfg["sync"][f"server_path_{kind}"]))
+        except ValueError as e:
+            return jsonify({"error": f"Auto-sync: {e}"}), 400
 
     cfg["leds"]["enabled"] = bool(data.get("leds_enabled"))
     for key, field in (("pin_wifi", "pin_wifi"), ("pin_cweb", "pin_cweb"), ("pin_abs", "pin_abs")):
@@ -3319,6 +3818,37 @@ def setup_apply():
 
     thread = threading.Thread(target=run_pipeline, args=(cfg, storage_device, format_device), daemon=True)
     thread.start()
+    return jsonify({"started": True})
+
+
+@app.route("/setup/browse", methods=["POST"])
+def setup_browse():
+    """Lists the shares on a server (no share given) or the folders inside a
+    share, for the folder picker on the Auto-sync step."""
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        server = smb_clean_host(data.get("server"))
+        username = _smb_clean_login(data.get("username"), "username").strip()
+        password = _smb_clean_login(data.get("password"), "password")
+        share = smb_clean_share(data["share"]) if (data.get("share") or "").strip() else ""
+        parts = smb_clean_path(data.get("path")) if share else []
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    problem = ensure_smbclient()
+    if problem:
+        return jsonify({"error": problem}), 503
+    result, problem = smb_browse(server, username, password, share, parts)
+    if problem:
+        return jsonify({"error": problem}), 502
+    return jsonify(result)
+
+
+@app.route("/setup/browse/prepare", methods=["POST"])
+def setup_browse_prepare():
+    """Starts installing the folder-browser tool in the background as soon as
+    auto-sync is ticked, so it's ready by the time Browse is tapped."""
+    start_smbclient_install_async()
     return jsonify({"started": True})
 
 
