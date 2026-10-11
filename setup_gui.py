@@ -359,6 +359,25 @@ def write_file(path, content, step_id, mode=None):
 # ---------------------------------------------------------------------------
 
 
+def validate_wifi_settings(cfg):
+    """WPA2-PSK requires an 8-63 character passphrase and a 1-32 byte SSID;
+    NetworkManager and wpa_supplicant both reject anything outside those
+    ranges with a fairly cryptic "property is invalid" error buried deep in
+    the pipeline. Catch it up front with a plain-English message instead."""
+    errors = []
+    ssid = cfg["wifi"]["ssid"]
+    password = cfg["wifi"]["password"]
+    ssid_len = len(ssid.encode("utf-8"))
+    if not (1 <= ssid_len <= 32):
+        errors.append(f"Wi-Fi network name must be 1-32 characters (\"{ssid}\" is {ssid_len}).")
+    if not (8 <= len(password) <= 63):
+        errors.append(
+            f"Wi-Fi password must be 8-63 characters — this is a WPA2 requirement, not "
+            f"something Lusty Library can relax (\"{password}\" is {len(password)})."
+        )
+    return errors
+
+
 def detect_network_backend():
     if shutil.which("nmcli"):
         rc = subprocess.run(
@@ -481,6 +500,13 @@ def apply_wifi_config_dhcpcd(cfg, step_id):
 
 
 def apply_wifi_config(cfg, step_id):
+    errors = validate_wifi_settings(cfg)
+    if errors:
+        # setup_apply() already rejects these before the pipeline ever
+        # starts, but this is the same check as a backstop in case
+        # config.yml was hand-edited directly (or an old one carried over).
+        raise StepFailed(" ".join(errors))
+
     backend = detect_network_backend()
     log_line(step_id, f"Detected network backend: {backend}")
     if backend == "networkmanager":
@@ -762,12 +788,28 @@ def _try_provision_calibre_web_account(base, username, password):
         "kobo_support": "",
         "download_role": "on",
         "viewer_role": "on",
+        # Calibre-Web's own new-user handler reads to_save["default_language"]
+        # with a plain dict lookup (no default) — omitting it throws an
+        # uncaught KeyError server-side, which is the HTTP 500 this was
+        # producing. "all" is the built-in "Show All" option, always valid
+        # regardless of what's in the library. "locale" (UI language) has a
+        # safe fallback in Calibre-Web itself, but we set it explicitly too
+        # rather than lean on that.
+        "default_language": "all",
+        "locale": "en",
     }
     if token:
         form["csrf_token"] = token
     resp = session.post(f"{base}/admin/user/new", data=form, timeout=10)
     if resp.status_code >= 400:
         raise RuntimeError(f"HTTP {resp.status_code} creating user")
+    if "user/new" in resp.url and "Oops" in resp.text:
+        # Calibre-Web returns 200 and re-renders the same "Add New User"
+        # form (rather than redirecting to the admin page) when the fields
+        # it got fail its own validation, e.g. a name/email collision from
+        # a previous attempt — raise so this is visible and retried/reported
+        # instead of being mistaken for success.
+        raise RuntimeError("Calibre-Web rejected the new-user form (see its own error/flash message)")
 
 
 def provision_calibre_web_account(cfg, step_id):
@@ -2559,7 +2601,9 @@ FORM_TEMPLATE = """
             </div>
             <div>
               <label>Password
-                <input name="wifi_password" value="{{ cfg.wifi.password }}" placeholder="e.g. lustybooks123">
+                <input name="wifi_password" value="{{ cfg.wifi.password }}" placeholder="e.g. lustybooks123"
+                       minlength="8" maxlength="63" title="8-63 characters (WPA2 requirement)">
+                <small>Must be 8-63 characters — WPA2 won't accept anything shorter.</small>
               </label>
             </div>
           </div>
@@ -2916,6 +2960,10 @@ def setup_apply():
     cfg["wifi"]["ssid"] = (data.get("wifi_ssid") or "").strip() or cfg["wifi"]["ssid"]
     cfg["wifi"]["password"] = (data.get("wifi_password") or "").strip() or cfg["wifi"]["password"]
     cfg["wifi"]["ip"] = (data.get("wifi_ip") or "").strip() or cfg["wifi"]["ip"]
+
+    wifi_errors = validate_wifi_settings(cfg)
+    if wifi_errors:
+        return jsonify({"error": " ".join(wifi_errors)}), 400
 
     cfg["storage"]["media_root"] = (data.get("media_root") or "").strip() or cfg["storage"]["media_root"]
     storage_device = (data.get("storage_device") or "").strip()
