@@ -247,6 +247,19 @@ to the library. Open `/welcome` and tap **Print**, or download the PDF at
 
 ---
 
+## Case & 3D print
+
+A 3D-printable case for the Pi, LEDs and shutdown button is available on
+Printables:
+
+> **Printables link: coming soon.**
+
+Once it's up, this section will also have:
+
+- Photos of the finished case
+- Recommended print settings (material, supports, infill)
+- A short build guide for fitting the Pi, LEDs and button
+
 ## Wiring (optional hardware)
 
 - **LEDs:** connect each LED's long leg to its GPIO pin through a resistor
