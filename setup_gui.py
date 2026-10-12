@@ -1887,6 +1887,22 @@ def ensure_gpio_deps(step_id):
     return True
 
 
+def free_gpio_pins(step_id):
+    """Makes sure nothing from a previous install is holding the LED/button
+    pins ("GPIO busy"): stops the status-LED and shutdown-button services and
+    any leftover status_leds.py, then logs whoever still has the GPIO chip."""
+    for unit in ("lustylibrary-leds.service", "lustylibrary-shutdown-button.service"):
+        run_cmd(["systemctl", "stop", unit], step_id, allow_fail=True)
+    run_cmd(["pkill", "-f", "/usr/local/bin/status_leds.py"], step_id, allow_fail=True)
+    time.sleep(0.7)
+    if shutil.which("fuser"):
+        holders = subprocess.run(
+            "fuser -v /dev/gpiochip* 2>&1 | grep -v '^$'", shell=True, capture_output=True, text=True
+        ).stdout.strip()
+        if holders:
+            log_line(step_id, "Still holding the GPIO chip:\n" + holders)
+
+
 def blink_led(pin, step_id, label, times=3, on_time=0.2, off_time=0.2):
     """Flashes a pin a few times so it's easy to spot which physical LED
     corresponds to which pin/feature, then leaves it ON and returns the
@@ -1904,7 +1920,14 @@ def blink_led(pin, step_id, label, times=3, on_time=0.2, off_time=0.2):
 
     log_line(step_id, f"Blinking {label} LED on GPIO{pin} ({times}x), then holding it on...")
     try:
-        led = LED(pin)
+        try:
+            led = LED(pin)
+        except Exception as first:  # noqa: BLE001
+            if "busy" not in str(first).lower():
+                raise
+            log_line(step_id, f"GPIO{pin} is busy, freeing it from other services and retrying...")
+            free_gpio_pins(step_id)
+            led = LED(pin)
         for _ in range(times):
             led.on()
             time.sleep(on_time)
@@ -2928,7 +2951,7 @@ def run_pipeline(cfg, storage_device, format_device):
         # leds: general test screen, up front. A previous install leaves the
         # LED service running and holding the pins ("GPIO busy"), so stop it
         # first; the LED step starts it again at the end.
-        run_cmd(["systemctl", "stop", "lustylibrary-leds.service"], "leds_test", allow_fail=True)
+        free_gpio_pins("leds_test")
         set_step("leds_test", "running")
         run_led_test_screen(cfg, "leds_test")
         set_step("leds_test", "done")
