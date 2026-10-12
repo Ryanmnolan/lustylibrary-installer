@@ -664,6 +664,19 @@ WantedBy=multi-user.target
     run_cmd(["systemctl", "enable", "--now", unit_name], step_id, allow_fail=True)
 
 
+def _first_partition(device):
+    """Path of the first partition on a disk, or "" if there isn't one."""
+    try:
+        out = subprocess.check_output(["lsblk", "-ln", "-o", "NAME,TYPE", device], text=True)
+    except Exception:
+        return ""
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == "part":
+            return "/dev/" + parts[0]
+    return ""
+
+
 def format_and_mount_device(device, mountpoint, step_id, fstype="ext4"):
     """EXTREMELY DESTRUCTIVE: wipes the given drive, formats it as ext4 and
     mounts it at the given mountpoint (and on every boot)."""
@@ -691,9 +704,19 @@ def format_and_mount_device(device, mountpoint, step_id, fstype="ext4"):
             f"{device} is still in use, so it can't be erased. Close anything using it "
             f"(for example a file manager), or reboot the Pi, then run setup again."
         )
-    run_cmd(["mkfs.ext4", "-F", device], step_id)
-    run_cmd(["mount", device, str(mountpoint)], step_id)
-    write_mount_unit(device, mountpoint, step_id, fstype)
+    # Give the drive a fresh GPT with one partition spanning it, then format
+    # that partition (the standard layout, and what "ready to use" detects).
+    run_cmd(["bash", "-c", f"printf 'label: gpt\\n,,L\\n' | sfdisk --wipe always {shlex.quote(device)}"], step_id)
+    run_cmd(["partprobe", device], step_id, allow_fail=True)
+    run_cmd(["udevadm", "settle"], step_id, allow_fail=True)
+    time.sleep(1.0)
+    part = _first_partition(device)
+    if not part:
+        raise StepFailed(f"Couldn't find the new partition on {device}. Unplug and re-plug the drive, then run setup again.")
+    log_line(step_id, f"Formatting {part} as ext4 (this can take a minute on a big drive)...")
+    run_cmd(["mkfs.ext4", "-F", part], step_id)
+    run_cmd(["mount", part, str(mountpoint)], step_id)
+    write_mount_unit(part, mountpoint, step_id, fstype)
 
 
 def use_existing_device(partition, mountpoint, step_id):
