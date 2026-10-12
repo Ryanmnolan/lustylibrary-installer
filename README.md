@@ -7,7 +7,7 @@ no internet needed.
 Supports **Raspberry Pi 3, 4 and 5**, on both the older dhcpcd/hostapd network
 stack and the newer NetworkManager stack used by current Raspberry Pi OS.
 
-## Original idea 
+## Original idea
 
 My wife fell in love with reading all over again after our second child was born. Through our oldest child's school, she made some wonderful friends, and together they started a monthly book club.
 
@@ -17,9 +17,9 @@ What started as a small project quickly became a huge hit at book club, and now 
 
 I originally wrote all the code myself, but recently used Claude AI to help clean things up and turn it into something much more polished and user-friendly.
 
-The best part? The whole thing is designed around a small case from Harbor Freight, 3d printed insert and leftover computer parts I had lying around.
+The best part? The whole thing is built around a small case from Harbor Freight, a 3D-printed insert and leftover computer parts I had lying around.
 
-It's been a fun project to build, improve, and watch everyone enjoy. I'm excited to finally share The Lusty Library with you! 
+It's been a fun project to build, improve, and watch everyone enjoy. I'm excited to finally share The Lusty Library with you!
 
 ## What you get
 
@@ -44,7 +44,7 @@ It's been a fun project to build, improve, and watch everyone enjoy. I'm excited
   network** (Wi-Fi or Ethernet) with internet access. The install downloads
   Docker and the apps, so it needs the internet.
 - A phone or computer on the **same network**, to run the setup wizard.
-- Optional: a USB drive for the books, LEDs, a shutdown button.
+- Optional: a USB drive for the books, status LEDs and a shutdown button.
 
 ## Step 1 - Install
 
@@ -278,12 +278,12 @@ Once it's up, this section will also have:
 
 - Photos of the finished case
 - Recommended print settings (material, supports, infill)
-- A short build guide for fitting the Pi, LEDs and buttons
+- A short build guide for fitting the Pi, LEDs and button
 
-The case is from harbor freight
+The case is from Harbor Freight:
 
--APACHE 1800 Weatherproof Protective Case, Small, Black
-https://www.harborfreight.com/1800-weatherproof-protective-case-small-black-64550.html
+- APACHE 1800 Weatherproof Protective Case, Small, Black
+  ([Harbor Freight product page](https://www.harborfreight.com/1800-weatherproof-protective-case-small-black-64550.html))
 
 ## Wiring (optional hardware)
 
