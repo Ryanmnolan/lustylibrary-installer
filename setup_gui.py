@@ -1646,7 +1646,30 @@ flock -n 9 || exit 0
   rsync -av --ignore-existing "${{SRC_AUDIO%/}}/" "$DST_AUDIO" || true
 
   echo "Syncing books..."
-  rsync -av --ignore-existing "${{SRC_BOOKS%/}}/" "$DST_BOOKS" || true
+  rsync -av --ignore-existing --exclude 'metadata.db' "${{SRC_BOOKS%/}}/" "$DST_BOOKS" || true
+
+  # Calibre-Web only shows the books listed in the library's metadata.db, and
+  # setup creates an empty one so Calibre-Web can start. So the server's real
+  # metadata.db has to replace it (after the book files are in place), and
+  # Calibre-Web is restarted so it re-reads the new list.
+  SRC_DB="${{SRC_BOOKS%/}}/metadata.db"
+  DST_DB="${{DST_BOOKS%/}}/metadata.db"
+  if [[ -f "$SRC_DB" ]]; then
+    if ! cmp -s "$SRC_DB" "$DST_DB"; then
+      echo "Updating the Calibre library list (metadata.db)..."
+      cp -f "$SRC_DB" "$DST_DB.new"
+      if [[ -f "$DST_DB" ]]; then chown --reference="$DST_DB" "$DST_DB.new" || true; fi
+      mv -f "$DST_DB.new" "$DST_DB"
+      if docker inspect calibre-web >/dev/null 2>&1; then
+        echo "Restarting Calibre-Web so the new books show up..."
+        docker restart calibre-web >/dev/null 2>&1 || echo "Couldn't restart Calibre-Web (is Docker running?)"
+      fi
+    else
+      echo "Calibre library list already up to date."
+    fi
+  else
+    echo "No metadata.db in the server's books folder - Calibre-Web can only show a real Calibre library."
+  fi
 
   unmount_all
 

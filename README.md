@@ -168,6 +168,10 @@ Notes:
 - Nothing is copied until an Ethernet cable is plugged in.
 - The **contents** of the folder you choose are copied into `audiobooks` and
   `books` on the Pi. Existing files are not overwritten.
+- For ebooks, choose a real **Calibre library** (a folder that contains a
+  `metadata.db` file). After the books are copied, the sync also updates the
+  Pi's `metadata.db` and restarts Calibre-Web, so the new books show up on
+  their own. Audiobookshelf finds new audiobooks by itself.
 
 ### Screen 6 - Hardware (optional)
 
