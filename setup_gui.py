@@ -1054,6 +1054,42 @@ def provision_calibre_web_account(cfg, step_id):
     cfg["apps"]["calibre_account_status"] = f"failed: {last_error}"
 
 
+def _abs_ensure_library(base, username, password, step_id):
+    """Audiobookshelf starts with no library, so the audiobooks folder is
+    invisible until someone adds one. Create an 'Audiobooks' library on the
+    mounted /audiobooks folder if there are no libraries yet."""
+    resp = requests.post(f"{base}/login", json={"username": username, "password": password}, timeout=15)
+    if resp.status_code != 200:
+        raise RuntimeError(f"HTTP {resp.status_code} logging in to add the library")
+    user = (resp.json() or {}).get("user") or {}
+    token = user.get("accessToken") or user.get("token")
+    if not token:
+        raise RuntimeError("no login token returned")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    libs = requests.get(f"{base}/api/libraries", headers=headers, timeout=15)
+    libs.raise_for_status()
+    body = libs.json()
+    existing = body.get("libraries", body) if isinstance(body, dict) else body
+    if existing:
+        log_line(step_id, "Audiobookshelf already has a library; leaving it as it is.")
+        return
+    created = requests.post(
+        f"{base}/api/libraries",
+        headers=headers,
+        json={
+            "name": "Audiobooks",
+            "folders": [{"fullPath": "/audiobooks"}],
+            "icon": "audiobookshelf",
+            "mediaType": "book",
+            "provider": "audible",
+        },
+        timeout=30,
+    )
+    created.raise_for_status()
+    log_line(step_id, "Created the 'Audiobooks' library in Audiobookshelf; it is scanning /audiobooks now.")
+
+
 def provision_audiobookshelf_account(cfg, step_id):
     """Sets up Audiobookshelf's one-time root account as the patron
     account, via the same /status + /init flow its own first-run setup
@@ -1096,6 +1132,17 @@ def provision_audiobookshelf_account(cfg, step_id):
     except Exception as e:  # noqa: BLE001 - best effort, never fail the install over this
         log_line(step_id, f"Couldn't auto-create the Audiobookshelf account: {e}", level="error")
         cfg["apps"]["audiobookshelf_account_status"] = f"failed: {e}"
+
+    if not str(cfg["apps"].get("audiobookshelf_account_status", "")).startswith("failed"):
+        try:
+            _abs_ensure_library(base, username, password, step_id)
+        except Exception as e:  # noqa: BLE001 - the library can always be added by hand
+            log_line(
+                step_id,
+                f"Couldn't create the Audiobookshelf library automatically: {e}. "
+                "In Audiobookshelf choose Add Library and pick the /audiobooks folder.",
+                level="error",
+            )
 
 
 def provision_accounts(cfg, step_id):
