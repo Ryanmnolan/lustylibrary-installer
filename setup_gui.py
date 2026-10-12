@@ -1781,7 +1781,21 @@ flock -n 9 || exit 0
     COUNT="$(wc -l < "$WORK/new.txt")"
     echo "Books: $COUNT new file(s) to hand to the library."
     if [[ "$COUNT" -gt 0 ]]; then
-      if rsync -rt --chown={MEDIA_UID}:{MEDIA_GID} --files-from="$WORK/new.txt" "${{SRC_BOOKS%/}}/" "$DST_INGEST"; then
+      # Copy to a staging folder on the same drive first, then move each book
+      # into the ingest folder as a plain file (no author sub-folders), owned
+      # by the library user. Flat files are what the importer handles best,
+      # and a move never shows it a half-copied book.
+      STAGE="$STATE_DIR/staging"
+      mkdir -p "$STAGE"
+      if rsync -rt --chown={MEDIA_UID}:{MEDIA_GID} --files-from="$WORK/new.txt" "${{SRC_BOOKS%/}}/" "$STAGE/"; then
+        while IFS= read -r -d '' f; do
+          dest="$DST_INGEST/$(basename "$f")"
+          if [[ -e "$dest" ]]; then
+            dest="$DST_INGEST/$(printf '%s' "$f" | md5sum | cut -c1-8)-$(basename "$f")"
+          fi
+          mv -f "$f" "$dest"
+        done < <(find "$STAGE" -type f -print0)
+        find "$STAGE" -mindepth 1 -type d -empty -delete
         cat "$WORK/new.txt" >> "$MANIFEST"
         LC_ALL=C sort -u "$MANIFEST" -o "$MANIFEST"
       else

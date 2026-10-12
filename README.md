@@ -175,7 +175,7 @@ Notes:
 - Nothing is copied until an Ethernet cable is plugged in.
 - Audiobooks are copied into `audiobooks` on the Pi. Existing files are not
   overwritten.
-- Ebooks are copied into the `ingest` folder, and the library adds them
+- Ebooks are copied into the `ingest` folder as plain files (author folders are flattened), and the library adds them
   **by itself** within a minute or so. Nobody has to scan anything. The folder
   you pick can be loose ebook files or a Calibre library; only the book files
   (epub, mobi, pdf and similar) are used. A book that was already delivered is
