@@ -259,6 +259,12 @@ to the library. Open `/welcome` and tap **Print**, or download the PDF at
 `/welcome.pdf`. It also lives in your media folder as `welcome.html` and
 `welcome.pdf`. Sections for anything you didn't install are left out.
 
+Here is an example of what it looks like (a real one, made by the installer):
+
+![Example welcome sheet](docs/images/welcome-sheet.png)
+
+[Download the example PDF](docs/lusty-library-welcome-example.pdf)
+
 ---
 
 ## Case & 3D print
