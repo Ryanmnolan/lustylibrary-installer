@@ -6,6 +6,8 @@ no internet needed.
 
 Supports **Raspberry Pi 3, 4 and 5**, on both the older dhcpcd/hostapd network
 stack and the newer NetworkManager stack used by current Raspberry Pi OS.
+A **Pi 4 (2 GB or more) or Pi 5 is recommended**. A Pi 3 works, but the ebook
+app is slower.
 
 ## Original idea
 
@@ -25,8 +27,9 @@ It's been a fun project to build, improve, and watch everyone enjoy. I'm excited
 
 - A **Wi-Fi hotspot** (name, password and IP are yours to choose)
 - [Audiobookshelf](https://www.audiobookshelf.org/) for audiobooks and
-  [Calibre-Web](https://github.com/janeczku/calibre-web) for ebooks, running
-  in Docker, with a shared **patron login** created for you
+  [Calibre-Web Automated](https://github.com/crocodilestick/Calibre-Web-Automated)
+  for ebooks (new books dropped in the `ingest` folder are added automatically),
+  running in Docker, with a shared **patron login** created for you
 - A **request page** where patrons ask for a book or audiobook (saved to a CSV
   you can read, with a one-tap "mark fulfilled")
 - A **printable welcome sheet** (landscape, one page, also as a PDF) with the
@@ -97,7 +100,7 @@ This is the Wi-Fi network patrons will join.
 Where the books and audiobooks are kept.
 
 1. **Media folder** - the default `/mnt/media` is fine. The installer creates
-   `audiobooks`, `books` and `config` folders inside it.
+   `audiobooks`, `books`, `ingest` and `config` folders inside it.
 2. **USB drive** - leave on *Keep existing storage as-is* to use the SD card.
    To use a USB drive, plug it in and choose it from the list.
 3. Only tick **Format the selected drive as ext4 and mount it at the media
@@ -109,7 +112,7 @@ Where the books and audiobooks are kept.
 
 ![Apps screen](docs/images/03-apps.jpg)
 
-1. Tick **Audiobookshelf** (audiobooks), **Calibre-Web** (ebooks), or both.
+1. Tick **Audiobookshelf** (audiobooks), **Calibre-Web Automated** (ebooks), or both.
    Docker is installed automatically if it isn't already.
 2. Choose the **patron username and password**. This one shared login works in
    both apps and is printed on the welcome sheet. The default is `book` /
@@ -158,7 +161,7 @@ screen** (leave the box unticked) if you don't need it.
      shows where you are. Tap any part of it to jump back.
    - When you're in the right folder, tap **Use this folder**.
    - If the server doesn't list its shares, you can type a share name by hand.
-5. Do the same for **Books (Calibre) folder on the server**.
+5. Do the same for **Books folder on the server**.
 6. Tap **Next**.
 
 Notes:
@@ -166,8 +169,15 @@ Notes:
 - The first time you tap **Browse**, the Pi installs a small tool (`smbclient`),
   so it needs internet at that moment. It may say "getting ready" for a minute.
 - Nothing is copied until an Ethernet cable is plugged in.
-- The **contents** of the folder you choose are copied into `audiobooks` and
-  `books` on the Pi. Existing files are not overwritten.
+- Audiobooks are copied into `audiobooks` on the Pi. Existing files are not
+  overwritten.
+- Ebooks are copied into the `ingest` folder, and the library adds them
+  **by itself** within a minute or so. Nobody has to scan anything. The folder
+  you pick can be loose ebook files or a Calibre library; only the book files
+  (epub, mobi, pdf and similar) are used. A book that was already delivered is
+  not copied again, even after the library has imported it.
+- A book that fails to import is kept in
+  `config/calibre/processed_books/failed` for you to look at.
 
 ### Screen 6 - Hardware (optional)
 
