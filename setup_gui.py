@@ -654,6 +654,14 @@ def ensure_docker(step_id):
     run_cmd(["sh", "/tmp/get-docker.sh"], step_id)
 
 
+# Calibre-Web Automated, pinned to a released version (not "latest") so an
+# install today and one next year behave the same.
+CWA_IMAGE = "crocodilestick/calibre-web-automated:v4.0.8"
+CWA_CONTAINER = "calibre-web-automated"
+MEDIA_UID = 1000
+MEDIA_GID = 1000
+
+
 def generate_docker_compose(cfg, step_id):
     media_root = cfg["storage"]["media_root"]
     install_abs = cfg["apps"]["install_audiobookshelf"]
@@ -679,18 +687,23 @@ def generate_docker_compose(cfg, step_id):
         ]
 
     if install_cweb:
+        # Calibre-Web Automated (CWA): Calibre-Web plus an "ingest" folder.
+        # Any book file dropped into the ingest folder is imported into the
+        # library on its own (and removed from the folder afterwards), so
+        # nobody has to scan or re-index anything.
         lines += [
-            "  calibre-web:",
-            "    image: lscr.io/linuxserver/calibre-web:latest",
-            "    container_name: calibre-web",
+            "  calibre-web-automated:",
+            f"    image: {CWA_IMAGE}",
+            "    container_name: calibre-web-automated",
             "    ports:",
             '      - "8083:8083"',
             "    environment:",
-            "      - PUID=1000",
-            "      - PGID=1000",
+            f"      - PUID={MEDIA_UID}",
+            f"      - PGID={MEDIA_GID}",
             "      - TZ=America/Chicago",
             "    volumes:",
-            f"      - {media_root}/books:/books",
+            f"      - {media_root}/books:/calibre-library",
+            f"      - {media_root}/ingest:/cwa-book-ingest",
             f"      - {media_root}/config/calibre:/config",
             "    restart: unless-stopped",
             "",
@@ -699,8 +712,18 @@ def generate_docker_compose(cfg, step_id):
     compose_path = Path("/home/pi/library-server")
     write_file(compose_path / "docker-compose.yml", "\n".join(lines), step_id)
 
-    for sub in ("audiobooks", "books", "config"):
+    for sub in ("audiobooks", "books", "config", "ingest"):
         Path(media_root, sub).mkdir(parents=True, exist_ok=True)
+    if install_cweb:
+        # CWA runs as an unprivileged user; it can only import books if the
+        # folders it uses are owned by that user, not root.
+        for sub in ("books", "ingest", "config/calibre"):
+            folder = Path(media_root, sub)
+            folder.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chown(folder, MEDIA_UID, MEDIA_GID)
+            except OSError as e:
+                log_line(step_id, f"Couldn't set the owner of {folder}: {e}", level="error")
 
     return compose_path / "docker-compose.yml"
 
@@ -724,40 +747,8 @@ def bring_up_apps(compose_path, step_id):
 # ---------------------------------------------------------------------------
 
 CALIBRE_DEFAULT_ADMIN_USER = "admin"
-CALIBRE_DEFAULT_ADMIN_PASSWORD = "admin123"  # linuxserver/calibre-web's documented first-run default
-CALIBRE_LIBRARY_PATH_IN_CONTAINER = "/books"  # matches the volume mount in generate_docker_compose()
-CALIBRE_EMPTY_LIBRARY_SCHEMA_PATH = Path(__file__).resolve().parent / "calibre_empty_library.sql"
-
-
-def ensure_calibre_library(cfg, step_id):
-    """Calibre-Web's first-run 'Database Configuration' step refuses to
-    accept a library path unless a *valid* metadata.db already exists
-    there — it never creates one itself (confirmed by reading Calibre-Web's
-    own source). So before that step can ever be automated, make sure a
-    genuine, empty Calibre library is already sitting at the configured
-    books path. Never touches anything if a metadata.db is already there
-    (a re-run, or a real library someone dropped in) — this only ever
-    creates one from nothing."""
-    books_dir = Path(cfg["storage"]["media_root"]) / "books"
-    metadata_db = books_dir / "metadata.db"
-    if metadata_db.exists():
-        log_line(step_id, "Calibre library already exists, leaving it as-is.")
-        return
-
-    try:
-        books_dir.mkdir(parents=True, exist_ok=True)
-        schema_sql = CALIBRE_EMPTY_LIBRARY_SCHEMA_PATH.read_text()
-        conn = sqlite3.connect(str(metadata_db))
-        try:
-            conn.executescript(schema_sql)
-            conn.execute("UPDATE library_id SET uuid = ?", (str(uuid.uuid4()),))
-            conn.commit()
-        finally:
-            conn.close()
-        log_line(step_id, f"Created a fresh, empty Calibre library at {metadata_db}.")
-    except Exception as e:  # noqa: BLE001 - best effort; Calibre-Web will just show its own setup wizard
-        log_line(step_id, f"Couldn't create an empty Calibre library ({e}); you may need to complete "
-                           "Calibre-Web's Database Configuration step by hand.", level="error")
+CALIBRE_DEFAULT_ADMIN_PASSWORD = "admin123"  # Calibre-Web (Automated) documented first-run default
+CALIBRE_LIBRARY_PATH_IN_CONTAINER = "/calibre-library"  # matches the volume mount in generate_docker_compose()
 
 
 def _wait_for_http(url, step_id, timeout=90):
@@ -799,24 +790,6 @@ def _try_provision_calibre_web_account(base, username, password):
     resp = session.post(f"{base}/login", data=login_data, timeout=10)
     if "login" in resp.url and resp.status_code == 200:
         raise RuntimeError("login page still shown after posting default admin credentials")
-
-    # Calibre-Web won't let ANY other admin route through until its own
-    # one-time "Database Configuration" step is done — it redirects every
-    # request back to /admin/dbconfig until a library path is set. Drive
-    # that same form the setup wizard itself would show you, every time;
-    # if it's already configured this is just a harmless re-save of the
-    # same value. ensure_calibre_library() (called earlier, in the "apps"
-    # step) guarantees a valid empty library already exists at this path,
-    # since Calibre-Web will refuse the path otherwise and never creates
-    # one on its own.
-    dbconfig_page = session.get(f"{base}/admin/dbconfig", timeout=10)
-    token = _extract_csrf_token(dbconfig_page.text)
-    dbconfig_form = {"config_calibre_dir": CALIBRE_LIBRARY_PATH_IN_CONTAINER}
-    if token:
-        dbconfig_form["csrf_token"] = token
-    resp = session.post(f"{base}/admin/dbconfig", data=dbconfig_form, timeout=10)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"HTTP {resp.status_code} setting the Calibre library path")
 
     _calibre_create_user(session, base, username, password)
 
@@ -871,8 +844,26 @@ def _calibre_disable_password_rules(session, base):
         raise RuntimeError(f"HTTP {resp.status_code} turning off Calibre-Web's password rules")
 
 
+def _calibre_set_library(session, base):
+    """If Calibre-Web hasn't picked its library yet it redirects every admin
+    page to /admin/dbconfig. Calibre-Web Automated normally finds
+    /calibre-library by itself, but if it hasn't yet, set it through the same
+    form the setup screen would show."""
+    page = session.get(f"{base}/admin/dbconfig", timeout=10)
+    token = _extract_csrf_token(page.text)
+    form = {"config_calibre_dir": CALIBRE_LIBRARY_PATH_IN_CONTAINER}
+    if token:
+        form["csrf_token"] = token
+    resp = session.post(f"{base}/admin/dbconfig", data=form, timeout=10)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"HTTP {resp.status_code} setting the Calibre library path")
+
+
 def _calibre_create_user(session, base, username, password):
     new_user_page = session.get(f"{base}/admin/user/new", timeout=10)
+    if "dbconfig" in new_user_page.url:
+        _calibre_set_library(session, base)
+        new_user_page = session.get(f"{base}/admin/user/new", timeout=10)
     if "user/new" not in new_user_page.url:
         raise RuntimeError(
             f"admin page redirected to {new_user_page.url} instead of the new-user form "
@@ -1536,6 +1527,9 @@ def smb_browse(server, username, password, share, parts):
     return {"folders": folders, "files": files, "path": "/" + "/".join(parts)}, None
 
 
+BOOK_EXT_PATTERN = "epub|mobi|azw|azw3|azw4|kepub|pdf|fb2|cbz|cbr|cb7|djvu|txt|rtf|docx|odt|htm|html|lit|lrf|prc|pdb|snb"
+
+
 def apply_sync_config(cfg, step_id):
     if not cfg["sync"]["enable_sync"]:
         log_line(step_id, "Auto-sync disabled, skipping.")
@@ -1587,7 +1581,9 @@ SRC_AUDIO="${{MOUNT_AUDIO}}"{q(path_audio)}
 SRC_BOOKS="${{MOUNT_BOOKS}}"{q(path_books)}
 
 DST_AUDIO={q(media_root.rstrip("/") + "/audiobooks/")}
-DST_BOOKS={q(media_root.rstrip("/") + "/books/")}
+DST_INGEST={q(media_root.rstrip("/") + "/ingest/")}
+STATE_DIR={q(media_root.rstrip("/") + "/.sync_state")}
+MANIFEST="$STATE_DIR/delivered_books.txt"
 
 CIFS_OPTS="{cifs_opts}"
 
@@ -1640,36 +1636,38 @@ flock -n 9 || exit 0
     exit 0
   fi
 
-  mkdir -p "$DST_AUDIO" "$DST_BOOKS"
+  mkdir -p "$DST_AUDIO" "$DST_INGEST" "$STATE_DIR"
+  touch "$MANIFEST"
 
   echo "Syncing audiobooks..."
   rsync -av --ignore-existing "${{SRC_AUDIO%/}}/" "$DST_AUDIO" || true
 
+  # Books go to the ingest folder, where Calibre-Web Automated imports them
+  # into its library by itself (and deletes the copies). Because the ingest
+  # folder empties out, a manifest of already-delivered files stops the same
+  # book from being copied again on the next sync.
   echo "Syncing books..."
-  rsync -av --ignore-existing --exclude 'metadata.db' "${{SRC_BOOKS%/}}/" "$DST_BOOKS" || true
-
-  # Calibre-Web only shows the books listed in the library's metadata.db, and
-  # setup creates an empty one so Calibre-Web can start. So the server's real
-  # metadata.db has to replace it (after the book files are in place), and
-  # Calibre-Web is restarted so it re-reads the new list.
-  SRC_DB="${{SRC_BOOKS%/}}/metadata.db"
-  DST_DB="${{DST_BOOKS%/}}/metadata.db"
-  if [[ -f "$SRC_DB" ]]; then
-    if ! cmp -s "$SRC_DB" "$DST_DB"; then
-      echo "Updating the Calibre library list (metadata.db)..."
-      cp -f "$SRC_DB" "$DST_DB.new"
-      if [[ -f "$DST_DB" ]]; then chown --reference="$DST_DB" "$DST_DB.new" || true; fi
-      mv -f "$DST_DB.new" "$DST_DB"
-      if docker inspect calibre-web >/dev/null 2>&1; then
-        echo "Restarting Calibre-Web so the new books show up..."
-        docker restart calibre-web >/dev/null 2>&1 || echo "Couldn't restart Calibre-Web (is Docker running?)"
+  WORK="$(mktemp -d)"
+  EMPTY="$WORK/empty"; mkdir -p "$EMPTY"
+  if rsync -rn --out-format='%n' "${{SRC_BOOKS%/}}/" "$EMPTY/" > "$WORK/all.txt" 2>>"$LOG"; then
+    grep -v '/$' "$WORK/all.txt" \
+      | grep -iE '\.({BOOK_EXT_PATTERN})$' | LC_ALL=C sort -u > "$WORK/candidates.txt" || true
+    LC_ALL=C sort -u "$MANIFEST" -o "$MANIFEST"
+    LC_ALL=C comm -23 "$WORK/candidates.txt" "$MANIFEST" > "$WORK/new.txt"
+    COUNT="$(wc -l < "$WORK/new.txt")"
+    echo "Books: $COUNT new file(s) to hand to the library."
+    if [[ "$COUNT" -gt 0 ]]; then
+      if rsync -rt --chown={MEDIA_UID}:{MEDIA_GID} --files-from="$WORK/new.txt" "${{SRC_BOOKS%/}}/" "$DST_INGEST"; then
+        cat "$WORK/new.txt" >> "$MANIFEST"
+        LC_ALL=C sort -u "$MANIFEST" -o "$MANIFEST"
+      else
+        echo "WARNING: some books could not be copied, will retry next sync."
       fi
-    else
-      echo "Calibre library list already up to date."
     fi
   else
-    echo "No metadata.db in the server's books folder - Calibre-Web can only show a real Calibre library."
+    echo "WARNING: could not read the books folder on the server."
   fi
+  rm -rf "$WORK"
 
   unmount_all
 
@@ -1931,7 +1929,7 @@ def generate_status_leds_script(cfg):
     cweb_block = ""
     if install_cweb:
         cweb_block = """
-        calibre_up = container_running("calibre-web")
+        calibre_up = container_running(CWA_CONTAINER)
         if not calibre_up:
             blink(LED_CWEB, 1)
         else:
@@ -2884,8 +2882,6 @@ def run_pipeline(cfg, storage_device, format_device):
         # apps
         set_step("apps", "running")
         compose_path = generate_docker_compose(cfg, "apps")
-        if cfg["apps"]["install_calibre_web"]:
-            ensure_calibre_library(cfg, "apps")
         bring_up_apps(compose_path, "apps")
         if cfg["apps"]["install_calibre_web"]:
             test_feature_led(cfg, "apps", cfg["leds"]["pin_cweb"], "Calibre-Web")
@@ -3140,7 +3136,7 @@ FORM_TEMPLATE = """
             <p class="step-intro">Where the books and audiobooks are kept.</p>
             <label>Media folder
               <input name="media_root" value="{{ cfg.storage.media_root }}" placeholder="e.g. /mnt/media" autocomplete="off">
-              <small>Subfolders <code>audiobooks</code>, <code>books</code> and <code>config</code> are created here.</small>
+              <small>Subfolders <code>audiobooks</code>, <code>books</code>, <code>ingest</code> and <code>config</code> are created here.</small>
             </label>
             <label>USB drive to use (optional)
               <select name="storage_device">
@@ -3166,7 +3162,7 @@ FORM_TEMPLATE = """
             </label>
             <label class="check">
               <input type="checkbox" id="cweb" name="install_calibre_web" {% if cfg.apps.install_calibre_web %}checked{% endif %}>
-              <span>Calibre-Web <small style="display:inline;">&mdash; ebooks</small></span>
+              <span>Calibre-Web Automated <small style="display:inline;">&mdash; ebooks</small></span>
             </label>
             <div class="opt-details" id="patron-details">
               <div class="row">
@@ -3199,7 +3195,7 @@ FORM_TEMPLATE = """
           </section>
 
           <section class="step" data-title="Auto-sync (optional)">
-            <p class="step-intro">Copy audiobooks and books from another computer or NAS on your network, automatically, the moment an Ethernet cable is plugged in. Skip this if you don't need it.</p>
+            <p class="step-intro">Copy audiobooks and books from another computer or NAS on your network, automatically, the moment an Ethernet cable is plugged in. New books are added to the library by themselves. Skip this if you don't need it.</p>
             <label class="check">
               <input type="checkbox" id="enable_sync" name="enable_sync" data-controls="sync-details" {% if cfg.sync.enable_sync %}checked{% endif %}>
               <span>Enable auto-sync from a server</span>
@@ -3225,7 +3221,7 @@ FORM_TEMPLATE = """
               <input type="hidden" name="server_share_audio" value="{{ cfg.sync.server_share_audio }}">
               <input type="hidden" name="server_path_audio" value="{{ cfg.sync.server_path_audio }}">
 
-              <div class="picker-label">Books (Calibre) folder on the server</div>
+              <div class="picker-label">Books folder on the server</div>
               <button type="button" class="picker" id="pick-books" data-kind="books"><span class="picker-text"></span><span class="picker-go">Browse</span></button>
               <input type="hidden" name="server_share_books" value="{{ cfg.sync.server_share_books }}">
               <input type="hidden" name="server_path_books" value="{{ cfg.sync.server_path_books }}">

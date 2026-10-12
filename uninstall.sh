@@ -122,11 +122,11 @@ except Exception:
       (cd "$COMPOSE_DIR" && docker compose down 2>/dev/null || docker-compose down 2>/dev/null)
     fi
     # Belt and braces in case the compose file is already gone.
-    docker rm -f audiobookshelf calibre-web >/dev/null 2>&1
+    docker rm -f audiobookshelf calibre-web calibre-web-automated >/dev/null 2>&1
     note "Containers stopped and removed."
     if [[ "$FULL" -eq 1 ]]; then
-      docker rmi ghcr.io/advplyr/audiobookshelf:latest lscr.io/linuxserver/calibre-web:latest >/dev/null 2>&1
-      note "Removed the Audiobookshelf and Calibre-Web images."
+      docker rmi ghcr.io/advplyr/audiobookshelf:latest lscr.io/linuxserver/calibre-web:latest crocodilestick/calibre-web-automated:v4.0.8 >/dev/null 2>&1
+      note "Removed the Audiobookshelf and Calibre-Web (Automated) images."
     else
       note "Images left alone (use --full to remove them)."
     fi
@@ -215,7 +215,7 @@ PYEOF
   step "Library data at $MEDIA_ROOT"
   if [[ "$PURGE_DATA" -eq 1 ]]; then
     if [[ -d "$MEDIA_ROOT" ]]; then
-      rm -rf "${MEDIA_ROOT:?}/books" "${MEDIA_ROOT:?}/audiobooks" "${MEDIA_ROOT:?}/config"
+      rm -rf "${MEDIA_ROOT:?}/books" "${MEDIA_ROOT:?}/audiobooks" "${MEDIA_ROOT:?}/config" "${MEDIA_ROOT:?}/ingest" "${MEDIA_ROOT:?}/.sync_state"
       rm -f "$MEDIA_ROOT/welcome.html" "$MEDIA_ROOT/welcome.pdf" "$MEDIA_ROOT/requests.csv"
       note "Wiped books/audiobooks/config/welcome page/requests under $MEDIA_ROOT."
     else
