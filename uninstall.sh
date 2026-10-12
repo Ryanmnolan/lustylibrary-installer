@@ -101,6 +101,8 @@ except Exception:
     lustylibrary-setup.service
     lustylibrary-requests.service
     lustylibrary-sync.service
+    lustylibrary-refresh.service
+    lustylibrary-refresh.timer
     lustylibrary-leds.service
     lustylibrary-shutdown-button.service
   )
@@ -197,6 +199,7 @@ PYEOF
   rm -f /etc/udev/rules.d/99-lustylibrary-sync.rules
   rm -f /etc/lustylibrary-sync-credentials
   rm -f /usr/local/bin/sync_from_server.sh
+  rm -f /usr/local/bin/lustylibrary-refresh-library.sh
   rm -f /run/sync_from_server.lock
   rmdir /mnt/remote_audio /mnt/remote_books /mnt/remote_data >/dev/null 2>&1 || true
   udevadm control --reload-rules >/dev/null 2>&1 || true
