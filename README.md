@@ -7,6 +7,20 @@ no internet needed.
 Supports **Raspberry Pi 3, 4 and 5**, on both the older dhcpcd/hostapd network
 stack and the newer NetworkManager stack used by current Raspberry Pi OS.
 
+## Original idea 
+
+My wife fell in love with reading all over again after our second child was born. Through our oldest child's school, she made some wonderful friends, and together they started a monthly book club.
+
+A little over two years ago, I built what we now call The Lusty Library. It started as a fun little project using a Raspberry Pi 4, an old 500GB SSD, and a whole lot of spaghetti code I wrote myself.
+
+What started as a small project quickly became a huge hit at book club, and now we want to share it with all of you!
+
+I originally wrote all the code myself, but recently used Claude AI to help clean things up and turn it into something much more polished and user-friendly.
+
+The best part? The whole thing is designed around a small case from Harbor Freight and leftover computer parts I had lying around.
+
+It's been a fun project to build, improve, and watch everyone enjoy. I'm excited to finally share The Lusty Library with you! 
+
 ## What you get
 
 - A **Wi-Fi hotspot** (name, password and IP are yours to choose)
