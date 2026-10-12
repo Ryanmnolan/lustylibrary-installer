@@ -17,7 +17,7 @@ What started as a small project quickly became a huge hit at book club, and now 
 
 I originally wrote all the code myself, but recently used Claude AI to help clean things up and turn it into something much more polished and user-friendly.
 
-The best part? The whole thing is designed around a small case from Harbor Freight and leftover computer parts I had lying around.
+The best part? The whole thing is designed around a small case from Harbor Freight, 3d printed insert and leftover computer parts I had lying around.
 
 It's been a fun project to build, improve, and watch everyone enjoy. I'm excited to finally share The Lusty Library with you! 
 
@@ -263,7 +263,7 @@ to the library. Open `/welcome` and tap **Print**, or download the PDF at
 
 ## Case & 3D print
 
-A 3D-printable case for the Pi, LEDs and shutdown button is available on
+A 3D-printable insert for the LEDs and shutdown button is available on
 Printables:
 
 > **Printables link: coming soon.**
@@ -272,7 +272,12 @@ Once it's up, this section will also have:
 
 - Photos of the finished case
 - Recommended print settings (material, supports, infill)
-- A short build guide for fitting the Pi, LEDs and button
+- A short build guide for fitting the Pi, LEDs and buttons
+
+The case is from harbor freight
+
+-APACHE 1800 Weatherproof Protective Case, Small, Black
+https://share.google/l4h2fm45iUjd6Q5Al
 
 ## Wiring (optional hardware)
 
