@@ -277,7 +277,7 @@ Once it's up, this section will also have:
 The case is from harbor freight
 
 -APACHE 1800 Weatherproof Protective Case, Small, Black
-https://share.google/l4h2fm45iUjd6Q5Al
+https://www.harborfreight.com/1800-weatherproof-protective-case-small-black-64550.html
 
 ## Wiring (optional hardware)
 
