@@ -677,10 +677,20 @@ def format_and_mount_device(device, mountpoint, step_id, fstype="ext4"):
     mountpoint = Path(mountpoint)
     mountpoint.mkdir(parents=True, exist_ok=True)
 
-    # Unmount the drive and any partitions on it, then clear old signatures
-    # (partition tables, NTFS markers) so the new filesystem is the only thing.
+    # Stop anything using the drive (a previous install's containers keep the
+    # media folder busy), unmount it and its partitions, then clear old
+    # signatures (partition tables, NTFS markers) so the new filesystem is
+    # the only thing left.
+    run_cmd(["bash", "-c", "docker ps -q 2>/dev/null | xargs -r docker stop >/dev/null 2>&1; true"], step_id, allow_fail=True)
+    unit_name = mountpoint.as_posix().lstrip("/").replace("/", "-") + ".mount"
+    run_cmd(["systemctl", "stop", unit_name], step_id, allow_fail=True)
     run_cmd(["bash", "-c", f"for p in {shlex.quote(device)}*; do umount \"$p\" 2>/dev/null; done; true"], step_id, allow_fail=True)
-    run_cmd(["wipefs", "-a", device], step_id, allow_fail=True)
+    rc = run_cmd(["wipefs", "-a", device], step_id, allow_fail=True)
+    if rc not in (0, None):
+        raise StepFailed(
+            f"{device} is still in use, so it can't be erased. Close anything using it "
+            f"(for example a file manager), or reboot the Pi, then run setup again."
+        )
     run_cmd(["mkfs.ext4", "-F", device], step_id)
     run_cmd(["mount", device, str(mountpoint)], step_id)
     write_mount_unit(device, mountpoint, step_id, fstype)
@@ -2915,7 +2925,10 @@ def run_pipeline(cfg, storage_device, format_device):
         log_line("preflight", f"Architecture: {board.get('arch', 'unknown')}")
         set_step("preflight", "done")
 
-        # leds: general test screen, up front
+        # leds: general test screen, up front. A previous install leaves the
+        # LED service running and holding the pins ("GPIO busy"), so stop it
+        # first; the LED step starts it again at the end.
+        run_cmd(["systemctl", "stop", "lustylibrary-leds.service"], "leds_test", allow_fail=True)
         set_step("leds_test", "running")
         run_led_test_screen(cfg, "leds_test")
         set_step("leds_test", "done")
@@ -2931,6 +2944,10 @@ def run_pipeline(cfg, storage_device, format_device):
         chosen = next((d for d in get_storage_devices() if d["path"] == storage_device), None) if storage_device else None
         if storage_device and not chosen:
             raise StepFailed(f"The drive {storage_device} isn't available any more. Plug it in and run setup again.")
+        if chosen:
+            log_line("storage", f"Drive {chosen['path']}: " + (
+                f"has a usable ext4 partition ({chosen['ready_part']})" if chosen["ready_part"] else "no usable ext4 partition")
+                + f"; erase requested: {'yes' if format_device else 'no'}.")
         if chosen and (format_device or not chosen["ready_part"]):
             format_and_mount_device(chosen["path"], cfg["storage"]["media_root"], "storage")
         elif chosen:
