@@ -578,13 +578,26 @@ def _tree_mountpoints(node):
     return mps
 
 
+def _human_size(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "?"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1000 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB", "MB") or n >= 100 else f"{n:.1f} {unit}"
+        n /= 1000
+
+
 def parse_storage_devices(data):
-    """Picks the drives that are good media-storage candidates from lsblk -J
-    output. USB-to-SATA/NVMe adapters usually report the drive as NOT
-    removable (RM=0), so a drive counts if it is removable, hot-pluggable or
-    on the USB bus. A blank drive has no partitions, so the whole disk is
-    offered. Anything holding / or /boot (the SD card or the system disk) is
-    never offered."""
+    """One entry per physical drive (not per partition), so the list stays
+    short. USB-to-SATA/NVMe adapters usually report the drive as NOT
+    removable, so a drive counts if it is removable, hot-pluggable or on the
+    USB/NVMe bus. Any disk holding / or /boot (the SD card or system disk) is
+    never offered.
+
+    Each entry says whether the drive is already "ready" (has an ext4
+    partition we can use as it is) or needs to be erased and set up."""
     devices = []
     for dev in data.get("blockdevices", []):
         name = dev.get("name") or ""
@@ -600,57 +613,37 @@ def parse_storage_devices(data):
         if any(m == "/" or m.startswith("/boot") for m in _tree_mountpoints(dev)):
             continue
         parts = [c for c in (dev.get("children") or []) if c.get("type") == "part"]
-        for node in parts or [dev]:
-            mp = node.get("mountpoint") or next((m for m in (node.get("mountpoints") or []) if m), "")
-            devices.append(
-                {
-                    "path": f"/dev/{node.get('name')}",
-                    "size": node.get("size") or "?",
-                    "fstype": node.get("fstype") or "",
-                    "mountpoint": mp or "",
-                    "model": (dev.get("model") or "").strip(),
-                }
-            )
+        ext4 = [c for c in parts if (c.get("fstype") or "") == "ext4"]
+        ready = max(ext4, key=lambda c: int(c.get("size") or 0)) if ext4 else None
+        ready_mp = ""
+        if ready:
+            ready_mp = ready.get("mountpoint") or next((m for m in (ready.get("mountpoints") or []) if m), "")
+        devices.append(
+            {
+                "path": f"/dev/{name}",
+                "model": (dev.get("model") or "").strip() or "USB drive",
+                "size": _human_size(dev.get("size")),
+                "ready_part": f"/dev/{ready['name']}" if ready else "",
+                "ready_mountpoint": ready_mp or "",
+            }
+        )
     return devices
 
 
 def get_storage_devices():
-    try:
-        out = subprocess.check_output(
-            ["lsblk", "-J", "-o", "NAME,SIZE,FSTYPE,MOUNTPOINT,MOUNTPOINTS,TYPE,RM,HOTPLUG,TRAN,MODEL"],
-            text=True,
-        )
-        return parse_storage_devices(json.loads(out))
-    except Exception:
-        # Older lsblk without the MOUNTPOINTS column.
+    cols = "NAME,SIZE,FSTYPE,MOUNTPOINT,TYPE,RM,HOTPLUG,TRAN,MODEL"
+    for extra in (",MOUNTPOINTS", ""):
         try:
-            out = subprocess.check_output(
-                ["lsblk", "-J", "-o", "NAME,SIZE,FSTYPE,MOUNTPOINT,TYPE,RM,HOTPLUG,TRAN,MODEL"],
-                text=True,
-            )
+            out = subprocess.check_output(["lsblk", "-b", "-J", "-o", cols + extra], text=True)
             return parse_storage_devices(json.loads(out))
         except Exception:
-            return []
+            continue
+    return []
 
 
-def format_and_mount_device(device, mountpoint, step_id, fstype="ext4"):
-    """EXTREMELY DESTRUCTIVE: formats the given device as ext4 and mounts
-    it at the given mountpoint, with a systemd mount unit for boot-time
-    auto-mount."""
-    if not device.startswith("/dev/"):
-        log_line(step_id, f"refusing to touch non-device path: {device}", level="error")
-        return
-    if "mmcblk0" in device:
-        log_line(step_id, "refusing to format the internal SD card (mmcblk0).", level="error")
-        return
-
+def write_mount_unit(device, mountpoint, step_id, fstype="ext4"):
+    """systemd mount unit so the drive mounts itself on every boot."""
     mountpoint = Path(mountpoint)
-    mountpoint.mkdir(parents=True, exist_ok=True)
-
-    run_cmd(["umount", device], step_id, allow_fail=True)
-    run_cmd(["mkfs.ext4", "-F", device], step_id)
-    run_cmd(["mount", device, str(mountpoint)], step_id)
-
     unit_name = mountpoint.as_posix().lstrip("/").replace("/", "-") + ".mount"
     unit_path = Path("/etc/systemd/system") / unit_name
     unit_content = f"""[Unit]
@@ -669,6 +662,42 @@ WantedBy=multi-user.target
     write_file(unit_path, unit_content, step_id)
     run_cmd(["systemctl", "daemon-reload"], step_id, allow_fail=True)
     run_cmd(["systemctl", "enable", "--now", unit_name], step_id, allow_fail=True)
+
+
+def format_and_mount_device(device, mountpoint, step_id, fstype="ext4"):
+    """EXTREMELY DESTRUCTIVE: wipes the given drive, formats it as ext4 and
+    mounts it at the given mountpoint (and on every boot)."""
+    if not device.startswith("/dev/"):
+        log_line(step_id, f"refusing to touch non-device path: {device}", level="error")
+        return
+    if "mmcblk0" in device:
+        log_line(step_id, "refusing to format the internal SD card (mmcblk0).", level="error")
+        return
+
+    mountpoint = Path(mountpoint)
+    mountpoint.mkdir(parents=True, exist_ok=True)
+
+    # Unmount the drive and any partitions on it, then clear old signatures
+    # (partition tables, NTFS markers) so the new filesystem is the only thing.
+    run_cmd(["bash", "-c", f"for p in {shlex.quote(device)}*; do umount \"$p\" 2>/dev/null; done; true"], step_id, allow_fail=True)
+    run_cmd(["wipefs", "-a", device], step_id, allow_fail=True)
+    run_cmd(["mkfs.ext4", "-F", device], step_id)
+    run_cmd(["mount", device, str(mountpoint)], step_id)
+    write_mount_unit(device, mountpoint, step_id, fstype)
+
+
+def use_existing_device(partition, mountpoint, step_id):
+    """Uses a drive that already has an ext4 partition, keeping its files."""
+    mountpoint = Path(mountpoint)
+    mountpoint.mkdir(parents=True, exist_ok=True)
+    current = subprocess.run(["findmnt", "-n", "-o", "TARGET", partition], capture_output=True, text=True).stdout.strip()
+    if current == str(mountpoint):
+        log_line(step_id, f"{partition} is already mounted at {mountpoint}; keeping its files.")
+    else:
+        if current:
+            run_cmd(["umount", partition], step_id, allow_fail=True)
+        run_cmd(["mount", partition, str(mountpoint)], step_id)
+    write_mount_unit(partition, mountpoint, step_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2899,8 +2928,13 @@ def run_pipeline(cfg, storage_device, format_device):
 
         # storage
         set_step("storage", "running")
-        if storage_device and format_device:
-            format_and_mount_device(storage_device, cfg["storage"]["media_root"], "storage")
+        chosen = next((d for d in get_storage_devices() if d["path"] == storage_device), None) if storage_device else None
+        if storage_device and not chosen:
+            raise StepFailed(f"The drive {storage_device} isn't available any more. Plug it in and run setup again.")
+        if chosen and (format_device or not chosen["ready_part"]):
+            format_and_mount_device(chosen["path"], cfg["storage"]["media_root"], "storage")
+        elif chosen:
+            use_existing_device(chosen["ready_part"], cfg["storage"]["media_root"], "storage")
         else:
             log_line("storage", "No device selected for formatting; using existing storage as-is.")
             Path(cfg["storage"]["media_root"]).mkdir(parents=True, exist_ok=True)
@@ -3170,20 +3204,20 @@ FORM_TEMPLATE = """
               <input name="media_root" value="{{ cfg.storage.media_root }}" placeholder="e.g. /mnt/media" autocomplete="off">
               <small>Subfolders <code>audiobooks</code>, <code>books</code>, <code>ingest</code> and <code>config</code> are created here.</small>
             </label>
-            <label>USB drive to use (optional)
-              <select name="storage_device">
-                <option value="">Keep existing storage as-is</option>
+            <label>Drive to use
+              <select name="storage_device" id="storage_device">
+                <option value="" data-state="none">Don't use a drive (store on the SD card)</option>
                 {% for d in devices %}
-                  <option value="{{ d.path }}">{{ d.path }}{% if d.model %} {{ d.model }}{% endif %} ({{ d.size }}, {{ d.fstype or 'unformatted' }}, {% if d.mountpoint %}mounted at {{ d.mountpoint }}{% else %}not mounted{% endif %})</option>
+                  <option value="{{ d.path }}" data-state="{{ 'ready' if d.ready_part else 'blank' }}"{% if d.ready_part and d.ready_mountpoint == cfg.storage.media_root %} selected{% endif %}>{{ d.model }} &middot; {{ d.size }} &middot; {{ 'ready to use, files kept' if d.ready_part else 'will be erased' }}</option>
                 {% endfor %}
               </select>
             </label>
-            <label class="check">
+            {% if not devices %}<small>No external drive found. Plug in your SSD or USB drive, wait a few seconds, then reload this page.</small>{% endif %}
+            <label class="check" id="erase-row" hidden>
               <input type="checkbox" id="format_device" name="format_device" data-warn="format-warning">
-              <span>Format the selected drive as ext4 and mount it at the media folder</span>
+              <span>Erase this drive and start fresh</span>
             </label>
             <div class="warn-box" id="format-warning" hidden>&#9888; This erases everything on the selected drive.</div>
-            <small>Already using an attached drive for media? Leave the drive on &ldquo;keep existing&rdquo; and don't tick the format box.</small>
           </section>
 
           <section class="step" data-title="Apps">
@@ -3410,7 +3444,6 @@ const validators = [
   },
   () => {  // Storage
     if (!val("media_root").startsWith("/")) return "The media folder must be a full path starting with /, like /mnt/media.";
-    if (on("format_device") && !val("storage_device")) return "You ticked format, but no USB drive is selected. Pick a drive, or untick the format box.";
     return "";
   },
   () => {  // Apps
@@ -3528,7 +3561,11 @@ function syncToggles() {
     document.getElementById(cb.dataset.controls).hidden = !cb.checked;
   });
   document.getElementById("patron-details").hidden = !(on("install_audiobookshelf") || on("install_calibre_web"));
-  document.getElementById("format-warning").hidden = !on("format_device");
+  const sd = form.elements["storage_device"];
+  const st = sd.options[sd.selectedIndex].dataset.state;
+  document.getElementById("erase-row").hidden = st !== "ready";
+  if (st !== "ready") form.elements["format_device"].checked = false;
+  document.getElementById("format-warning").hidden = !(st === "blank" || on("format_device"));
 }
 form.addEventListener("change", syncToggles);
 syncToggles();
@@ -3712,15 +3749,16 @@ renderPickers();
 // ---- review screen ----
 function renderReview() {
   const dev = form.elements["storage_device"];
-  const devText = dev.value ? dev.options[dev.selectedIndex].text : "Keep existing storage as-is";
+  const devText = dev.value ? dev.options[dev.selectedIndex].text : "SD card (no external drive)";
+  const devState = dev.value ? dev.options[dev.selectedIndex].dataset.state : "none";
   const yn = (b) => b ? "Yes" : "No";
   const groups = [];
 
   groups.push({title: "Wi-Fi hotspot", step: 0, rows: [
     ["Network name", val("wifi_ssid")], ["Password", val("wifi_password")], ["Hotspot IP", val("wifi_ip")]]});
 
-  const storage = [["Media folder", val("media_root")], ["USB drive", devText]];
-  if (on("format_device") && dev.value) storage.push(["Format", "ERASES " + dev.value, "warn"]);
+  const storage = [["Media folder", val("media_root")], ["Drive", devText]];
+  if (dev.value && (devState === "blank" || on("format_device"))) storage.push(["Erase", "ERASES " + dev.value, "warn"]);
   groups.push({title: "Storage", step: 1, rows: storage});
 
   const apps = [["Audiobookshelf", yn(on("install_audiobookshelf"))], ["Calibre-Web", yn(on("install_calibre_web"))]];

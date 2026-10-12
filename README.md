@@ -101,11 +101,15 @@ Where the books and audiobooks are kept.
 
 1. **Media folder** - the default `/mnt/media` is fine. The installer creates
    `audiobooks`, `books`, `ingest` and `config` folders inside it.
-2. **USB drive** - leave on *Keep existing storage as-is* to use the SD card.
-   To use a USB drive, plug it in and choose it from the list.
-3. Only tick **Format the selected drive as ext4 and mount it at the media
-   folder** if you want the drive **erased**. **This deletes everything on it.**
-   If the drive already holds your library, leave it unticked.
+2. **Drive to use** - each drive you plug in shows up once, with its name and
+   size. Pick your SSD or USB drive. The list tells you what will happen:
+   - *ready to use, files kept* - the drive already has a Linux (ext4)
+     partition, so it is used as it is and nothing is deleted.
+   - *will be erased* - the drive is blank or in another format (Windows, for
+     example). It is erased and set up for you. **This deletes everything on it.**
+   - *Don't use a drive* - keeps everything on the SD card.
+3. For a *ready to use* drive, an **Erase this drive and start fresh** box
+   appears. Leave it unticked unless you want to wipe the drive.
 4. Tap **Next**.
 
 ### Screen 3 - Apps
