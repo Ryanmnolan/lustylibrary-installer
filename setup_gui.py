@@ -564,41 +564,73 @@ def apply_wifi_config(cfg, step_id):
 # ---------------------------------------------------------------------------
 
 
-def get_storage_devices():
-    """Removable partitions that look like good media-storage candidates.
-    Deliberately skips the internal mmcblk0 (SD card / root)."""
+def _truthy(v):
+    return str(v).lower() in ("1", "true", "yes")
+
+
+def _tree_mountpoints(node):
+    """Every mountpoint used by a device and everything under it."""
+    mps = [m for m in (node.get("mountpoints") or []) if m]
+    if node.get("mountpoint"):
+        mps.append(node["mountpoint"])
+    for ch in node.get("children") or []:
+        mps.extend(_tree_mountpoints(ch))
+    return mps
+
+
+def parse_storage_devices(data):
+    """Picks the drives that are good media-storage candidates from lsblk -J
+    output. USB-to-SATA/NVMe adapters usually report the drive as NOT
+    removable (RM=0), so a drive counts if it is removable, hot-pluggable or
+    on the USB bus. A blank drive has no partitions, so the whole disk is
+    offered. Anything holding / or /boot (the SD card or the system disk) is
+    never offered."""
     devices = []
+    for dev in data.get("blockdevices", []):
+        name = dev.get("name") or ""
+        if dev.get("type") != "disk" or name.startswith(("mmcblk", "loop", "zram", "ram")):
+            continue
+        usbish = (
+            _truthy(dev.get("rm"))
+            or _truthy(dev.get("hotplug"))
+            or str(dev.get("tran") or "").lower() in ("usb", "nvme")
+        )
+        if not usbish:
+            continue
+        if any(m == "/" or m.startswith("/boot") for m in _tree_mountpoints(dev)):
+            continue
+        parts = [c for c in (dev.get("children") or []) if c.get("type") == "part"]
+        for node in parts or [dev]:
+            mp = node.get("mountpoint") or next((m for m in (node.get("mountpoints") or []) if m), "")
+            devices.append(
+                {
+                    "path": f"/dev/{node.get('name')}",
+                    "size": node.get("size") or "?",
+                    "fstype": node.get("fstype") or "",
+                    "mountpoint": mp or "",
+                    "model": (dev.get("model") or "").strip(),
+                }
+            )
+    return devices
+
+
+def get_storage_devices():
     try:
         out = subprocess.check_output(
-            ["lsblk", "-J", "-o", "NAME,SIZE,FSTYPE,MOUNTPOINT,TYPE,RM"], text=True
+            ["lsblk", "-J", "-o", "NAME,SIZE,FSTYPE,MOUNTPOINT,MOUNTPOINTS,TYPE,RM,HOTPLUG,TRAN,MODEL"],
+            text=True,
         )
-        data = json.loads(out)
-
-        def visit(node):
-            t = node.get("type")
-            name = node.get("name")
-            rm = node.get("rm", 0)
-            mp = node.get("mountpoint")
-            size = node.get("size")
-            fstype = node.get("fstype")
-            if "children" in node:
-                for ch in node["children"]:
-                    visit(ch)
-            if t == "part" and name and not name.startswith("mmcblk0") and str(rm) in ("1", "true", "True"):
-                devices.append(
-                    {
-                        "path": f"/dev/{name}",
-                        "size": size or "?",
-                        "fstype": fstype or "",
-                        "mountpoint": mp or "",
-                    }
-                )
-
-        for dev in data.get("blockdevices", []):
-            visit(dev)
+        return parse_storage_devices(json.loads(out))
     except Exception:
-        pass
-    return devices
+        # Older lsblk without the MOUNTPOINTS column.
+        try:
+            out = subprocess.check_output(
+                ["lsblk", "-J", "-o", "NAME,SIZE,FSTYPE,MOUNTPOINT,TYPE,RM,HOTPLUG,TRAN,MODEL"],
+                text=True,
+            )
+            return parse_storage_devices(json.loads(out))
+        except Exception:
+            return []
 
 
 def format_and_mount_device(device, mountpoint, step_id, fstype="ext4"):
@@ -3142,7 +3174,7 @@ FORM_TEMPLATE = """
               <select name="storage_device">
                 <option value="">Keep existing storage as-is</option>
                 {% for d in devices %}
-                  <option value="{{ d.path }}">{{ d.path }} ({{ d.size }}, {{ d.fstype or 'unformatted' }}, {% if d.mountpoint %}mounted at {{ d.mountpoint }}{% else %}not mounted{% endif %})</option>
+                  <option value="{{ d.path }}">{{ d.path }}{% if d.model %} {{ d.model }}{% endif %} ({{ d.size }}, {{ d.fstype or 'unformatted' }}, {% if d.mountpoint %}mounted at {{ d.mountpoint }}{% else %}not mounted{% endif %})</option>
                 {% endfor %}
               </select>
             </label>
