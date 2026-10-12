@@ -20,6 +20,7 @@ import os
 import platform
 import re
 import shlex
+import errno
 import shutil
 import sqlite3
 import subprocess
@@ -717,6 +718,35 @@ def format_and_mount_device(device, mountpoint, step_id, fstype="ext4"):
     run_cmd(["mkfs.ext4", "-F", part], step_id)
     run_cmd(["mount", part, str(mountpoint)], step_id)
     write_mount_unit(part, mountpoint, step_id, fstype)
+
+
+def ensure_media_root(media_root, step_id):
+    """Creates the media folder. If it is a dead mount (a drive that was
+    erased or unplugged, still registered as a mount), remove the stale mount
+    and its boot-time unit first so the folder can be created again."""
+    path = Path(media_root)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        (path / ".lusty_write_test").touch()
+        (path / ".lusty_write_test").unlink()
+        return
+    except OSError as e:
+        if e.errno not in (errno.ENODEV, errno.EIO, errno.ENOTCONN, errno.ESTALE, errno.EROFS, errno.ENXIO):
+            raise
+        log_line(step_id, f"{media_root} isn't usable ({e.strerror}); clearing the old drive mount...")
+    unit_name = path.as_posix().lstrip("/").replace("/", "-") + ".mount"
+    run_cmd(["systemctl", "disable", "--now", unit_name], step_id, allow_fail=True)
+    run_cmd(["umount", "-l", media_root], step_id, allow_fail=True)
+    unit_path = Path("/etc/systemd/system") / unit_name
+    if unit_path.exists():
+        unit_path.unlink()
+    run_cmd(["systemctl", "daemon-reload"], step_id, allow_fail=True)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise StepFailed(
+            f"{media_root} still can't be used ({e.strerror}). Reboot the Pi, or pick a drive on the Storage step."
+        )
 
 
 def use_existing_device(partition, mountpoint, step_id):
@@ -3000,7 +3030,7 @@ def run_pipeline(cfg, storage_device, format_device):
             use_existing_device(chosen["ready_part"], cfg["storage"]["media_root"], "storage")
         else:
             log_line("storage", "No device selected for formatting; using existing storage as-is.")
-            Path(cfg["storage"]["media_root"]).mkdir(parents=True, exist_ok=True)
+            ensure_media_root(cfg["storage"]["media_root"], "storage")
         set_step("storage", "done")
 
         # docker
