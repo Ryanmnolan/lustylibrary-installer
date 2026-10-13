@@ -24,6 +24,7 @@ import errno
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -4167,6 +4168,8 @@ fetch("/setup/state").then(r => r.json()).then(state => {
 
 @app.route("/")
 def index():
+    if ADMIN["installed"]():
+        return redirect(url_for("monitor"))
     return redirect(url_for("setup"))
 
 
@@ -4394,6 +4397,14 @@ def setup_stream():
     resp.headers["Cache-Control"] = "no-cache"
     resp.headers["X-Accel-Buffering"] = "no"
     return resp
+
+
+# Login, Monitor and Settings pages (see admin_ui.py). Registered last so its
+# before_request gate covers every route above.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import admin_ui  # noqa: E402
+
+ADMIN = admin_ui.register(app, os.environ.get("LUSTYLIBRARY_ADMIN_DIR") or INSTALL_DIR, load_config, STATE, STATE_LOCK)
 
 
 if __name__ == "__main__":
