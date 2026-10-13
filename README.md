@@ -175,13 +175,41 @@ Notes:
 - Nothing is copied until an Ethernet cable is plugged in.
 - Audiobooks are copied into `audiobooks` on the Pi. Existing files are not
   overwritten.
-- Ebooks are copied into the `ingest` folder as plain files (author folders are flattened), and the library adds them
-  **by itself** within a minute or so. Nobody has to scan anything. The folder
+- Ebooks are copied into the `ingest` folder as plain files (author folders
+  are flattened), and the library adds them **by itself**, one at a time.
+  Nobody has to scan anything. The folder
   you pick can be loose ebook files or a Calibre library; only the book files
   (epub, mobi, pdf and similar) are used. A book that was already delivered is
   not copied again, even after the library has imported it.
 - A book that fails to import is kept in
   `config/calibre/processed_books/failed` for you to look at.
+
+#### The first sync can take a long time
+
+Your first sync copies the whole library, so **be patient: it can take hours,
+or even most of a day for a big collection.** This only happens once. Later
+syncs only bring the new books and finish in minutes.
+
+- **Audiobooks** are large, so the copy is limited by your network and the
+  Pi's drive. Audiobookshelf finds them as they arrive.
+- **Ebooks** are copied quickly, but the library then imports them one at a
+  time. On a Raspberry Pi that is roughly **two books a minute**, so 600 books
+  take around five hours. A Pi 4 or Pi 5 is faster than a Pi 3.
+- Books show up **gradually**. The ebook list refreshes by itself every few
+  minutes while books are still being imported, so reload the page now and
+  then.
+- Leave the Pi **powered on, with the Ethernet cable and the drive
+  connected**, until it finishes. If it is interrupted, plug the cable in again
+  and it carries on. Books already copied are skipped.
+
+To check progress, run these on the Pi:
+
+```
+sudo tail -f /var/log/sync_from_server.log      # the sync itself
+find /mnt/media/ingest -type f | wc -l          # ebooks still waiting (counts down to 0)
+```
+
+The sync is finished when the second number reaches `0`.
 
 ### Screen 6 - Hardware (optional)
 
@@ -334,6 +362,8 @@ sudo systemctl restart lustylibrary-setup
 | The page froze during the install | Leave it. Reload `http://<pi-ip>:9000/setup`; it reconnects to the running install. |
 | Patron login doesn't work | Setup checks the login at the end. If the step shows an error, create the user in Calibre-Web as `admin` / `admin123` (Admin, then Add new user). |
 | Folder browser says it can't reach the server | Check the server IP, that the server is on the same network, and the username and password. |
+| The ebook library is empty or only shows a few books | Normal during the first big sync. Books are imported one at a time and the list refreshes every few minutes. Check `find /mnt/media/ingest -type f \| wc -l`; while that number is going down, it is working. See [the first sync can take a long time](#the-first-sync-can-take-a-long-time). |
+| "Undervoltage detected" in `sudo dmesg`, or the drive drops out | The Pi is not getting enough power. Use the official Raspberry Pi power supply (5.1V, 3A) and a good cable, or put the SSD on a powered USB hub. |
 | A step failed | Read the console on the progress page and `/var/log/lustylibrary-install.log`, fix the cause, then use **Change settings** and run it again. |
 
 ## Files
