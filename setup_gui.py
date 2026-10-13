@@ -1175,6 +1175,39 @@ def provision_audiobookshelf_account(cfg, step_id):
             )
 
 
+def install_library_refresh(cfg, step_id):
+    """Calibre-Web Automated only tells the website to re-read the library once
+    the importer has been quiet for a moment, so during a big import the site
+    keeps showing an empty library. This timer runs the importer's own
+    follow-up every few minutes while books are waiting, so new books show up
+    as they are imported."""
+    if not cfg["apps"]["install_calibre_web"]:
+        return
+    ingest = cfg["storage"]["media_root"].rstrip("/") + "/ingest"
+    script = f"""#!/bin/bash
+# Refresh the ebook library view while books are still being imported.
+INGEST={shlex.quote(ingest)}
+docker inspect -f '{{{{.State.Running}}}}' {CWA_CONTAINER} 2>/dev/null | grep -q true || exit 0
+[[ -n "$(find "$INGEST" -type f -print -quit 2>/dev/null)" ]] || exit 0
+docker exec {CWA_CONTAINER} python3 /app/calibre-web-automated/scripts/ingest_processor.py --post-batch-follow-up >/dev/null 2>&1 || true
+"""
+    write_file("/usr/local/bin/lustylibrary-refresh-library.sh", script, step_id, mode=0o755)
+    write_file(
+        "/etc/systemd/system/lustylibrary-refresh.service",
+        "[Unit]\nDescription=Refresh the Lusty Library ebook list while importing\n\n"
+        "[Service]\nType=oneshot\nExecStart=/usr/local/bin/lustylibrary-refresh-library.sh\n",
+        step_id,
+    )
+    write_file(
+        "/etc/systemd/system/lustylibrary-refresh.timer",
+        "[Unit]\nDescription=Refresh the Lusty Library ebook list every few minutes\n\n"
+        "[Timer]\nOnBootSec=3min\nOnUnitActiveSec=5min\n\n[Install]\nWantedBy=timers.target\n",
+        step_id,
+    )
+    run_cmd(["systemctl", "daemon-reload"], step_id, allow_fail=True)
+    run_cmd(["systemctl", "enable", "--now", "lustylibrary-refresh.timer"], step_id, allow_fail=True)
+
+
 def provision_accounts(cfg, step_id):
     if cfg["apps"]["install_calibre_web"]:
         provision_calibre_web_account(cfg, step_id)
@@ -2136,8 +2169,8 @@ def generate_status_leds_script(cfg):
 
     cweb_block = ""
     if install_cweb:
-        cweb_block = """
-        calibre_up = container_running(CWA_CONTAINER)
+        cweb_block = f"""
+        calibre_up = container_running({CWA_CONTAINER!r})
         if not calibre_up:
             blink(LED_CWEB, 1)
         else:
@@ -3112,6 +3145,7 @@ def run_pipeline(cfg, storage_device, format_device):
         # accounts: create the patron login shown on the welcome page
         set_step("accounts", "running")
         provision_accounts(cfg, "accounts")
+        install_library_refresh(cfg, "accounts")
         set_step("accounts", "done")
 
         # requests page
