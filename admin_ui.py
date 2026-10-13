@@ -27,8 +27,12 @@ SYNC_FLAG = Path("/tmp/sync_in_progress")
 ETH_CARRIER = Path("/sys/class/net/eth0/carrier")
 CONTAINERS = [("audiobookshelf", "Audiobookshelf"), ("calibre-web-automated", "Calibre-Web Automated")]
 
-# Pages/endpoints that work without logging in.
-PUBLIC_ENDPOINTS = {"login", "logout", "welcome", "welcome_pdf", "static"}
+# Pages/endpoints that work without logging in. Only the setup wizard (and its
+# /setup/... actions) is password-protected after the first install; Monitor and
+# Settings are open.
+PUBLIC_ENDPOINTS = {"login", "logout", "welcome", "welcome_pdf", "static",
+                    "monitor", "settings", "api_status", "admin_sync", "admin_reboot",
+                    "admin_shutdown", "admin_hardware_test"}
 # Needed to finish the very first install (reboot button etc.) in the same
 # browser session that ran it, before the service restarts.
 FIRST_RUN_ENDPOINTS = {"setup", "setup_state", "setup_stream", "setup_reboot", "setup_confirm"}
@@ -285,9 +289,9 @@ pre { background:#030712; border-radius:8px; padding:10px; font-size:13px; white
 """
 
 LOGIN_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Lusty Library - Sign in</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Lusty Library - Setup password</title>
 <style>{{ css|safe }}</style></head><body><div class="wrap" style="max-width:420px;padding-top:60px">
-<div class="card"><h2>Lusty Library admin</h2>
+<div class="card"><h2>Lusty Library setup</h2>
 <form method="post"><input type="password" name="password" placeholder="Password" autofocus autocomplete="current-password">
 {% if error %}<div class="err">{{ error }}</div>{% endif %}
 <input type="hidden" name="next" value="{{ next }}">
@@ -298,8 +302,7 @@ LAYOUT_HEAD = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <style>{{ css|safe }}</style></head><body><div class="wrap">
 <div class="top"><h1>Lusty Library</h1><nav>
 <a href="/monitor" class="{{ 'cur' if title=='Monitor' }}">Monitor</a>
-<a href="/settings" class="{{ 'cur' if title=='Settings' }}">Settings</a>
-<a href="/logout">Sign out</a></nav></div>"""
+<a href="/settings" class="{{ 'cur' if title=='Settings' }}">Settings</a></nav></div>"""
 
 MONITOR_TEMPLATE = LAYOUT_HEAD + """
 <div id="alerts"></div>
@@ -364,7 +367,7 @@ SETTINGS_TEMPLATE = LAYOUT_HEAD + """
 <div class="btns"><button id="b-reboot" class="ghost">Reboot</button><button id="b-off" class="danger">Shut down</button></div>
 <p class="note">Shut down before unplugging the Pi. The hotspot goes away until it is powered on again.</p><p class="note" id="m-power"></p></div>
 <div class="card"><h2>Advanced</h2>
-<p class="note" style="margin-top:0">Re-run the setup wizard to change the hotspot, drive, apps or sync settings. This will restart the hotspot and apps.</p>
+<p class="note" style="margin-top:0">Re-run the setup wizard to change the hotspot, drive, apps or sync settings. It asks for the admin password. This will restart the hotspot and apps.</p>
 <div class="btns"><a href="/setup"><button class="ghost" type="button">Re-run setup</button></a></div></div>
 <script>
 async function post(url){ const r = await fetch(url,{method:'POST'}); let j={}; try{ j=await r.json(); }catch(e){} return [r.ok,j]; }
@@ -431,9 +434,9 @@ def register(app, install_dir, load_config, state, state_lock):
 
     @app.route("/login", methods=["GET", "POST"])
     def login():
-        nxt = request.values.get("next") or "/monitor"
+        nxt = request.values.get("next") or "/setup"
         if not nxt.startswith("/") or nxt.startswith("//"):
-            nxt = "/monitor"
+            nxt = "/setup"
         error = None
         if request.method == "POST":
             given = (request.form.get("password") or "").encode()

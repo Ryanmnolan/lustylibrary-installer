@@ -311,10 +311,10 @@ Here is an example of what it looks like (a real one, made by the installer):
 
 ## Monitor & settings (after setup)
 
-Once the first install has finished, the setup page is locked. Open `http://10.10.10.10:9000` (or the Pi's address on your home network) and sign in with the password **`LustyLibrary`**. This password is fixed - it can't be changed - so treat the admin page as "anyone who knows the project can sign in". The welcome sheet (`/welcome`) stays public because patrons scan it.
+Once the first install has finished, the **setup wizard** is locked behind a password: **`LustyLibrary`**. It's fixed and can't be changed, so treat it as a guard against accidental clicks, not real security. The **Monitor** and **Settings** pages are open to anyone on the Lusty Library Wi-Fi or your home network at `http://10.10.10.10:9000/monitor` (and `/settings`). The welcome sheet (`/welcome`) is public too.
 
 - **Monitor** refreshes every 5 seconds and shows: whether the Wi-Fi hotspot is up (and how many phones are connected), whether Audiobookshelf and Calibre-Web Automated are running, whether a sync is running, ebooks still waiting to import, failed imports, free space on the drive, power (low-voltage warnings), temperature, and the last sync time and result. A "Needs attention" box lists anything wrong.
-- **Settings** has a **Start sync** button (needs the Ethernet cable plugged in, and says so if it isn't), a **hardware test** that flashes each LED and waits for a power-button press (the LED and button services pause during the test and restart afterwards), **Reboot** and **Shut down** buttons, and **Re-run setup** to change the hotspot, drive, apps or sync settings.
+- **Settings** has a **Start sync** button (needs the Ethernet cable plugged in, and says so if it isn't), a **hardware test** that flashes each LED and waits for a power-button press (the LED and button services pause during the test and restart afterwards), **Reboot** and **Shut down** buttons, and **Re-run setup** (asks for the password) to change the hotspot, drive, apps or sync settings.
 
 ## Case & 3D print
 
