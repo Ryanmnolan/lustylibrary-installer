@@ -210,6 +210,7 @@ PYEOF
   step "Removing generated scripts"
   rm -f /usr/local/bin/library_requests.py
   rm -f /usr/local/bin/status_leds.py
+  rm -f /opt/lustylibrary-installer/.installed /opt/lustylibrary-installer/.secret_key
   rm -f /usr/local/bin/shutdown_button.py
 
   # -------------------------------------------------------------------------
