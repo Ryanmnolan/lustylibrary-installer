@@ -322,28 +322,57 @@ Once the first install has finished, the **setup wizard** is locked behind a pas
 
 ## Case & 3D print
 
-A 3D-printable insert for the LEDs and shutdown button is available on
-Printables:
+A 3D-printable insert for the LEDs, the shutdown button and an RJ45 keystone
+jack is available on Printables:
 
 > **Printables link: coming soon.**
 
-Once it's up, this section will also have:
+![The insert in the case, at an angle](docs/images/insert-angle.jpg)
 
-- Photos of the finished case
-- Recommended print settings (material, supports, infill)
-- A short build guide for fitting the Pi, LEDs and button
+![The insert from above](docs/images/insert-top.jpg)
 
-The case is from Harbor Freight:
+The insert is made for one case, and it doesn't fit any other. It is sized for
+the **APACHE 1800 Weatherproof Protective Case, Small, Black**
+([Harbor Freight product page](https://www.harborfreight.com/1800-weatherproof-protective-case-small-black-64550.html)).
+It has three 5 mm LED holes, a hole for a 12 mm push button, and an opening for
+an RJ45 keystone jack. I printed it in three parts and fused them together with
+a soldering iron. Print settings: PLA, 20% infill.
 
-- APACHE 1800 Weatherproof Protective Case, Small, Black
-  ([Harbor Freight product page](https://www.harborfreight.com/1800-weatherproof-protective-case-small-black-64550.html))
+### Parts list
+
+| Qty | Part | Notes |
+|-----|------|-------|
+| 1 | APACHE 1800 case | Linked above |
+| 3 | [5 mm LEDs](https://a.co/d/02wJoa7X) | One green, one yellow, one blue (matches the welcome sheet) |
+| 3 | [330 ohm resistors](https://a.co/d/0ilPnb2c) | One per LED |
+| 1 | [12 mm momentary push button](https://a.co/d/0ajX9YHT) | The safe-shutdown button |
+| 1 | RJ45 keystone jack | Lets you plug the network cable in from outside the case |
+| - | Jumper wires, solder | To connect the LEDs and button to the Pi's header |
+
+The LEDs and the button are optional. Turn them on in the wizard's Hardware screen.
+
+All the parts are on this [Amazon wish list](https://www.amazon.com/hz/wishlist/ls/2Z6XI66JNRJ7T?ref_=wl_share).
 
 ## Wiring (optional hardware)
 
-- **LEDs:** connect each LED's long leg to its GPIO pin through a resistor
-  (about 330 ohm), and its short leg to ground.
-- **Shutdown button:** one side to the button GPIO pin, the other side to
-  ground. No resistor is needed.
+![Wiring diagram](docs/images/wiring.svg)
+
+These are the default pins. You can change them in the wizard's Hardware screen.
+
+| Part | Pi pin | GPIO | Goes to |
+|------|--------|------|---------|
+| Green LED (Wi-Fi is ready) | 11 | GPIO17 | resistor, then LED long leg (+) |
+| Yellow LED (ebooks are ready) | 13 | GPIO27 | resistor, then LED long leg (+) |
+| Blue LED (audiobooks are ready) | 15 | GPIO22 | resistor, then LED long leg (+) |
+| Shutdown button | 37 | GPIO26 | one side of the button |
+| Ground | 39 (any GND pin) | - | every LED short leg (-) and the other side of the button |
+
+- **LEDs:** each LED's long leg goes to its GPIO pin through a 330 ohm resistor,
+  and its short leg goes to ground. A lit LED means that service is up. This matches the
+  welcome sheet: green = Wi-Fi is ready, blue = audiobooks are ready, yellow =
+  ebooks are ready.
+- **Shutdown button:** one side to GPIO26, the other side to ground. No resistor
+  is needed. Hold the button for about two seconds to shut the Pi down safely.
 - To check your wiring outside the wizard, run
   `sudo python3 /opt/lustylibrary-installer/gpio_diagnostic.py`.
 

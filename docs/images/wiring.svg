@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 400" font-family="system-ui,Arial,sans-serif" font-size="14">
+<rect width="640" height="400" fill="#ffffff"/>
+<text x="320" y="26" text-anchor="middle" font-size="18" font-weight="700" fill="#111">Lusty Library insert wiring (default pins)</text>
+<!-- Pi header -->
+<rect x="20" y="50" width="150" height="330" rx="8" fill="#e5e7eb" stroke="#374151" stroke-width="2"/>
+<text x="95" y="72" text-anchor="middle" font-weight="700" fill="#111">Raspberry Pi</text>
+<text x="95" y="90" text-anchor="middle" font-size="12" fill="#374151">GPIO header (odd pins)</text>
+<g fill="#111" font-size="13">
+<circle cx="170" cy="190" r="5" fill="#16a34a"/><text x="30" y="194">Pin 11  GPIO17</text>
+<circle cx="170" cy="230" r="5" fill="#16a34a"/><text x="30" y="234">Pin 13  GPIO27</text>
+<circle cx="170" cy="270" r="5" fill="#16a34a"/><text x="30" y="274">Pin 15  GPIO22</text>
+<circle cx="170" cy="330" r="5" fill="#2563eb"/><text x="30" y="334">Pin 37  GPIO26</text>
+<circle cx="170" cy="360" r="5" fill="#111"/><text x="30" y="364">Pin 39  GND</text>
+</g>
+<!-- LED rows -->
+<g stroke="#374151" stroke-width="2" fill="none">
+<path d="M170 190 H250"/><path d="M170 230 H250"/><path d="M170 270 H250"/>
+<rect x="250" y="180" width="60" height="20" fill="#fff"/><rect x="250" y="220" width="60" height="20" fill="#fff"/><rect x="250" y="260" width="60" height="20" fill="#fff"/>
+<path d="M310 190 H380"/><path d="M310 230 H380"/><path d="M310 270 H380"/>
+<path d="M410 190 H610"/><path d="M410 230 H610"/><path d="M410 270 H610"/>
+<path d="M610 190 V360 H400"/>
+</g>
+<g fill="#111" font-size="12" text-anchor="middle">
+<text x="280" y="175">330 ohm</text><text x="280" y="215">330 ohm</text><text x="280" y="255">330 ohm</text>
+</g>
+<g stroke="#374151" stroke-width="2">
+<polygon fill="#4ade80" points="380,178 380,202 410,190"/><polygon fill="#fde047" points="380,218 380,242 410,230"/><polygon fill="#60a5fa" points="380,258 380,282 410,270"/>
+</g>
+<g stroke="#374151" stroke-width="2"><path d="M410 178 V202"/><path d="M410 218 V242"/><path d="M410 258 V282"/></g>
+<g fill="#111" font-size="12"><text x="430" y="184">Green LED (Wi-Fi)</text><text x="430" y="224">Yellow LED (ebooks)</text><text x="430" y="264">Blue LED (audiobooks)</text></g>
+<text x="322" y="296" text-anchor="middle" font-size="12" fill="#374151">LED long leg (+) toward the resistor, short leg (-) to ground</text>
+<!-- button -->
+<g stroke="#374151" stroke-width="2" fill="none"><path d="M170 330 H300"/><path d="M360 330 H400 V360 H170"/></g>
+<circle cx="300" cy="330" r="5" fill="#111"/><circle cx="360" cy="330" r="5" fill="#111"/>
+<path d="M300 330 L355 318" stroke="#111" stroke-width="3"/>
+<text x="330" y="316" text-anchor="middle" font-size="12" fill="#111">Shutdown button</text>
+<text x="420" y="350" font-size="12" fill="#374151">no resistor needed</text>
+<text x="320" y="394" text-anchor="middle" font-size="12" fill="#374151">All grounds meet at Pin 39 (any GND pin works).</text>
+</svg>
