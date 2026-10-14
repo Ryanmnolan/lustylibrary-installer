@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
@@ -153,7 +154,61 @@ def library_status(media_root):
         "importing": in_ingest,
         "copying": in_stage or 0,
         "failed": _count_files(failed_dir) if failed_dir.exists() else 0,
+        "failed_names": failed_names(media_root),
+        "ebooks_total": count_library_books(media_root),
+        "audiobooks_total": count_audiobooks(media_root),
     }
+
+
+AUDIO_EXT = {".m4b", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac", ".wav"}
+
+
+def count_library_books(media_root):
+    """Books Calibre-Web has imported (rows in its Calibre metadata.db)."""
+    db = Path(media_root) / "books" / "metadata.db"
+    if not db.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
+        try:
+            return con.execute("select count(*) from books").fetchone()[0]
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+
+
+def count_audiobooks(media_root, limit=200000):
+    """Audiobooks = folders that hold audio files (one per book)."""
+    root = Path(media_root) / "audiobooks"
+    if not root.exists():
+        return None
+    folders, seen = set(), 0
+    try:
+        for dp, _dn, files in os.walk(root):
+            for f in files:
+                if os.path.splitext(f)[1].lower() in AUDIO_EXT:
+                    folders.add(dp)
+                    break
+            seen += 1
+            if seen > limit:
+                break
+    except OSError:
+        return None
+    return len(folders)
+
+
+def failed_names(media_root, limit=10):
+    d = Path(media_root) / "config" / "calibre" / "processed_books" / "failed"
+    names = []
+    try:
+        for _dp, _dn, files in os.walk(d):
+            names += [f for f in files if not f.startswith(".")]
+            if len(names) > limit:
+                break
+    except OSError:
+        pass
+    return sorted(names)[:limit]
 
 
 def books_to_copy(text):
@@ -338,18 +393,21 @@ async function load(){
   let d;
   try { const r = await fetch('/api/status'); if (r.status==401){ location='/login'; return; } d = await r.json(); }
   catch(e){ document.getElementById('stamp').textContent='Can\\'t reach the Pi right now - retrying...'; return; }
-  const alerts = [];
+  const alerts = []; let power = '';
   let s = row('Wi-Fi hotspot', dot(d.wifi.up, d.wifi.up ? 'Up ('+esc(d.wifi.ssid)+')' : 'Down'));
   if (d.wifi.clients!==null) s += row('Phones connected', d.wifi.clients);
   d.containers.forEach(c=>{ s += row(c.label, dot(c.up, c.up ? 'Running' : esc(c.detail))); if(!c.up) alerts.push(c.label+' is not running.'); });
   if (!d.wifi.up) alerts.push('The Wi-Fi hotspot is down.');
   document.getElementById('services').innerHTML = s;
   const L = d.library;
-  let l = row('Ebooks waiting to import', L.waiting===null?'-':L.waiting);
+  let l = row('Ebooks in library', L.ebooks_total===null?'-':L.ebooks_total);
+  l += row('Audiobooks in library', L.audiobooks_total===null?'-':L.audiobooks_total);
+  l += row('Ebooks waiting to import', L.waiting===null?'-':L.waiting);
   if (L.copying>0) l += row('Still copying from server', L.copying+' so far');
   if (d.sync.running && d.sync.books_to_copy!==null) l += row('New ebooks this sync', d.sync.books_to_copy);
   l += row('Failed imports', L.failed===null?'-':L.failed, L.failed>0?'warn':'');
-  if (L.failed>0) alerts.push(L.failed+' ebook(s) failed to import.');
+  if (L.failed>0){ alerts.push(L.failed+' ebook(s) failed to import.');
+    l += '<div class="note">Failed: '+L.failed_names.map(esc).join(', ')+(L.failed>L.failed_names.length?' ...':'')+'</div>'; }
   if (d.disk.ok){ const pct=Math.round(100*d.disk.free/d.disk.total);
     l += row('Drive', dot(d.disk.mounted, d.disk.mounted ? 'Mounted' : 'Not a separate drive'));
     l += row('Free space', gb(d.disk.free)+' of '+gb(d.disk.total)+' ('+pct+'%)', pct<10?'bad':'');
@@ -366,11 +424,11 @@ async function load(){
   let h = '';
   if (d.power){ const p=d.power;
     h += row('Power', p.undervoltage_now ? dot(false,'Under-voltage right now') : p.undervoltage_past ? '<span class="warn"><span class="dot"></span>Dipped since boot</span>' : dot(true,'Good'));
-    if (p.undervoltage_now||p.undervoltage_past) alerts.push('The Pi reported low power. Use the official power supply and a good cable - a weak supply can corrupt the drive.');
+    if (p.undervoltage_now||p.undervoltage_past) power = (p.undervoltage_now ? 'LOW POWER RIGHT NOW. ' : 'The Pi dipped to low power since it started. ') + 'Use the official power supply and a short, good cable. A weak supply can corrupt the drive.';
   } else h += row('Power', 'Not available');
   h += row('Temperature', d.temp_c===null?'-':d.temp_c+' °C', d.temp_c>=75?'bad':d.temp_c>=65?'warn':'');
   document.getElementById('health').innerHTML = h;
-  document.getElementById('alerts').innerHTML = alerts.length ? '<div class="card bad"><h2>Needs attention</h2>'+alerts.map(a=>'<div>• '+esc(a)+'</div>').join('')+'</div>' : '';
+  document.getElementById('alerts').innerHTML = (power ? '<div class="card" style="background:#7f1d1d;color:#fff"><h2 style="color:#fff">⚡ Power problem</h2>'+esc(power)+'</div>' : '') + (alerts.length ? '<div class="card bad"><h2>Needs attention</h2>'+alerts.map(a=>'<div>• '+esc(a)+'</div>').join('')+'</div>' : '');
   document.getElementById('stamp').textContent = 'Updated '+d.time+' - refreshes every 5 seconds.';
 }
 load(); setInterval(load, 5000);

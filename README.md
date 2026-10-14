@@ -315,7 +315,7 @@ Once the first install has finished, the **setup wizard** is locked behind a pas
 
 ![The Monitor page](docs/images/monitor-page.jpg)
 
-- **Monitor** refreshes every 5 seconds and shows: whether the Wi-Fi hotspot is up (and how many phones are connected), whether Audiobookshelf and Calibre-Web Automated are running, whether a sync is running, ebooks waiting to import (including ones still being copied from your server during a long first sync), failed imports, free space on the drive, power (low-voltage warnings), temperature, and the last sync time and result. A "Needs attention" box lists anything wrong.
+- **Monitor** refreshes every 5 seconds and shows: whether the Wi-Fi hotspot is up (and how many phones are connected), whether Audiobookshelf and Calibre-Web Automated are running, whether a sync is running, ebooks and audiobooks in the library, ebooks waiting to import (including ones still being copied from your server during a long first sync), failed imports, free space on the drive, power (low-voltage warnings), temperature, and the last sync time and result. A "Needs attention" box lists anything wrong.
 ![The Settings page](docs/images/settings-page.jpg)
 
 - **Settings** has a **Start sync** button (needs the Ethernet cable plugged in, and says so if it isn't), a **hardware test** that flashes each LED and waits for a power-button press (the LED and button services pause during the test and restart afterwards), **Reboot** and **Shut down** buttons, and **Re-run setup** (asks for the password) to change the hotspot, drive, apps or sync settings.
