@@ -137,12 +137,29 @@ def _count_files(root, limit=100000):
 
 
 def library_status(media_root):
+    """waiting = books not yet in the library: files in the importer's ingest
+    folder plus books the sync has copied to its staging folder but not yet
+    handed over (on a first sync the copy can run for hours, during which the
+    ingest folder alone would read 0)."""
     root = Path(media_root)
+    ingest = root / "ingest"
+    stage = root / ".sync_state" / "staging"
     failed_dir = root / "config" / "calibre" / "processed_books" / "failed"
+    in_ingest = _count_files(ingest) if ingest.exists() else None
+    in_stage = _count_files(stage) if stage.exists() else 0
+    waiting = None if in_ingest is None else in_ingest + (in_stage or 0)
     return {
-        "waiting": _count_files(root / "ingest") if (root / "ingest").exists() else None,
+        "waiting": waiting,
+        "importing": in_ingest,
+        "copying": in_stage or 0,
         "failed": _count_files(failed_dir) if failed_dir.exists() else 0,
     }
+
+
+def books_to_copy(text):
+    """'Books: N new file(s) to hand to the library.' from the latest sync."""
+    found = re.findall(r"^Books: (\d+) new file", text, re.M)
+    return int(found[-1]) if found else None
 
 
 def parse_sync_log(text):
@@ -171,6 +188,7 @@ def sync_status():
     except OSError:
         text = ""
     info = parse_sync_log(text)
+    info["books_to_copy"] = books_to_copy(text) if info.get("result") == "running" else None
     info["running"] = SYNC_FLAG.exists()
     try:
         info["ethernet"] = ETH_CARRIER.read_text().strip() == "1"
@@ -328,6 +346,8 @@ async function load(){
   document.getElementById('services').innerHTML = s;
   const L = d.library;
   let l = row('Ebooks waiting to import', L.waiting===null?'-':L.waiting);
+  if (L.copying>0) l += row('Still copying from server', L.copying+' so far');
+  if (d.sync.running && d.sync.books_to_copy!==null) l += row('New ebooks this sync', d.sync.books_to_copy);
   l += row('Failed imports', L.failed===null?'-':L.failed, L.failed>0?'warn':'');
   if (L.failed>0) alerts.push(L.failed+' ebook(s) failed to import.');
   if (d.disk.ok){ const pct=Math.round(100*d.disk.free/d.disk.total);
