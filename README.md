@@ -325,7 +325,7 @@ Once the first install has finished, the **setup wizard** is locked behind a pas
 A 3D-printable insert for the LEDs, the shutdown button and an RJ45 keystone
 jack is available on Printables:
 
-> **Printables link: coming soon.**
+> **[Lusty Library case insert on Printables](https://www.printables.com/model/1856982-lusty-library-case-insert)**
 
 ![The insert in the case, at an angle](docs/images/insert-angle.jpg)
 
