@@ -8,6 +8,7 @@ Supports **Raspberry Pi 3, 4 and 5**, on both the older dhcpcd/hostapd network
 stack and the newer NetworkManager stack used by current Raspberry Pi OS.
 A **Pi 4 (2 GB or more) or Pi 5 is recommended**. A Pi 3 works, but the ebook
 app is slower.
+Fully tested on a **Raspberry Pi 4 (2 GB)**.
 
 ## Original idea
 
