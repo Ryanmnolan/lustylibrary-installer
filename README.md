@@ -343,13 +343,15 @@ a soldering iron. Print settings: PLA, 20% infill.
 | Qty | Part | Notes |
 |-----|------|-------|
 | 1 | APACHE 1800 case | Linked above |
-| 3 | [5 mm LEDs](https://a.co/d/02wJoa7X) | Any colour; use the same colour order you will remember |
+| 3 | [5 mm LEDs](https://a.co/d/02wJoa7X) | One green, one yellow, one blue (matches the welcome sheet) |
 | 3 | [330 ohm resistors](https://a.co/d/0ilPnb2c) | One per LED |
 | 1 | [12 mm momentary push button](https://a.co/d/0ajX9YHT) | The safe-shutdown button |
 | 1 | RJ45 keystone jack | Lets you plug the network cable in from outside the case |
 | - | Jumper wires, solder | To connect the LEDs and button to the Pi's header |
 
 The LEDs and the button are optional. Turn them on in the wizard's Hardware screen.
+
+All the parts are on this [Amazon wish list](https://www.amazon.com/hz/wishlist/ls/2Z6XI66JNRJ7T?ref_=wl_share).
 
 ## Wiring (optional hardware)
 
@@ -359,15 +361,16 @@ These are the default pins. You can change them in the wizard's Hardware screen.
 
 | Part | Pi pin | GPIO | Goes to |
 |------|--------|------|---------|
-| Wi-Fi LED | 11 | GPIO17 | resistor, then LED long leg (+) |
-| Calibre-Web LED | 13 | GPIO27 | resistor, then LED long leg (+) |
-| Audiobookshelf LED | 15 | GPIO22 | resistor, then LED long leg (+) |
+| Green LED (Wi-Fi is ready) | 11 | GPIO17 | resistor, then LED long leg (+) |
+| Yellow LED (ebooks are ready) | 13 | GPIO27 | resistor, then LED long leg (+) |
+| Blue LED (audiobooks are ready) | 15 | GPIO22 | resistor, then LED long leg (+) |
 | Shutdown button | 37 | GPIO26 | one side of the button |
 | Ground | 39 (any GND pin) | - | every LED short leg (-) and the other side of the button |
 
 - **LEDs:** each LED's long leg goes to its GPIO pin through a 330 ohm resistor,
-  and its short leg goes to ground. A lit LED means that service is up; the
-  Wi-Fi LED blinks while the hotspot starts and flickers during a sync.
+  and its short leg goes to ground. A lit LED means that service is up. This matches the
+  welcome sheet: green = Wi-Fi is ready, blue = audiobooks are ready, yellow =
+  ebooks are ready.
 - **Shutdown button:** one side to GPIO26, the other side to ground. No resistor
   is needed. Hold the button for about two seconds to shut the Pi down safely.
 - To check your wiring outside the wizard, run
