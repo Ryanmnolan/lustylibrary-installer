@@ -1,5 +1,10 @@
 # Lusty Library Installer
 
+![Raspberry Pi 3 | 4 | 5](https://img.shields.io/badge/Raspberry%20Pi-3%20%7C%204%20%7C%205-c51a4a?logo=raspberrypi&logoColor=white)
+![Tested on Raspberry Pi 4 (2 GB)](https://img.shields.io/badge/tested%20on-Pi%204%20(2%20GB)-2ea44f)
+![Docker](https://img.shields.io/badge/Docker-apps-2496ed?logo=docker&logoColor=white)
+![Works offline](https://img.shields.io/badge/works-offline-6e40c9)
+
 Turn a Raspberry Pi into an **offline library**: its own Wi-Fi hotspot that
 patrons join to read ebooks, listen to audiobooks and ask for new titles, with
 no internet needed.
