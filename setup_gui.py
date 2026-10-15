@@ -283,11 +283,86 @@ STEP_ORDER = [
     ("welcome_page", "Generating welcome page & PDF"),
 ]
 
+APPLIED_SNAPSHOT_NAME = ".applied_config.json"
+# Config keys the installer fills in itself; they never count as a user change.
+_DERIVED_KEYS = {"calibre_account_status", "audiobookshelf_account_status"}
+
+
+def applied_snapshot_path():
+    return CONFIG_PATH.parent / APPLIED_SNAPSHOT_NAME
+
+
+def load_applied_snapshot():
+    """The settings the last SUCCESSFUL run applied, or None if there isn't
+    one (first install, or an install from before this existed)."""
+    try:
+        return json.loads(applied_snapshot_path().read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def save_applied_snapshot(cfg):
+    try:
+        applied_snapshot_path().write_text(json.dumps(cfg, sort_keys=True))
+    except OSError:
+        pass
+
+
+def _section(cfg, name):
+    sec = dict(cfg.get(name) or {})
+    for k in _DERIVED_KEYS:
+        sec.pop(k, None)
+    return sec
+
+
+def plan_changes(old, new, storage_changed=False, force_all=False):
+    """Works out which install steps need to run by comparing the settings
+    the last successful run applied (old) with the new ones. Returns
+    (plan, needs_reboot): plan maps step id -> True (run) / False (skip).
+    With no previous run, or force_all, everything runs."""
+    ids = [sid for sid, _ in STEP_ORDER]
+    if force_all or old is None:
+        return {sid: True for sid in ids}, True
+
+    def differs(name):
+        return _section(old, name) != _section(new, name)
+
+    wifi_c = differs("wifi")
+    storage_c = storage_changed or old["storage"].get("media_root") != new["storage"].get("media_root")
+    apps_c = differs("apps") or storage_c
+    sync_c = differs("sync") or storage_c
+    leds_c = differs("leds")
+    btn_c = differs("shutdown_button") or leds_c
+    req_c = differs("requests_page") or wifi_c
+    # The LED daemon reports on the apps and the hotspot, so it follows them.
+    led_svc_c = leds_c or apps_c or wifi_c
+    anything = any([wifi_c, storage_c, apps_c, sync_c, leds_c, btn_c, req_c])
+    plan = {
+        "preflight": True,
+        "leds_test": leds_c,
+        "wifi": wifi_c,
+        "storage": storage_c,
+        "docker": apps_c,
+        "apps": apps_c,
+        "accounts": apps_c,
+        "requests_page": req_c,
+        "sync": sync_c,
+        "trigger": sync_c,
+        "leds_service": led_svc_c,
+        "shutdown_button": btn_c,
+        "qr_codes": anything,
+        "welcome_page": anything,
+    }
+    # Only a changed hotspot needs a reboot: it is saved now and starts on boot.
+    return plan, wifi_c
+
+
 STATE_LOCK = threading.Lock()
 STATE = {
     "running": False,
     "finished": False,
     "ok": None,
+    "needs_reboot": True,
     "steps": {step_id: "pending" for step_id, _ in STEP_ORDER},
 }
 
@@ -3075,119 +3150,180 @@ def write_welcome_page(cfg, step_id):
 # ---------------------------------------------------------------------------
 
 
-def run_pipeline(cfg, storage_device, format_device):
+def run_pipeline(cfg, storage_device, format_device, plan=None, needs_reboot=True):
     with STATE_LOCK:
         if STATE["running"]:
             return
         STATE["running"] = True
         STATE["finished"] = False
         STATE["ok"] = None
+        STATE["needs_reboot"] = needs_reboot
         for step_id, _ in STEP_ORDER:
             STATE["steps"][step_id] = "pending"
 
+    plan = plan or {sid: True for sid, _ in STEP_ORDER}
     emit("start")
     ok = True
     try:
         # preflight
-        set_step("preflight", "running")
-        board = load_board_info()
-        log_line("preflight", f"Board: {board.get('model', 'unknown')}")
-        log_line("preflight", f"OS codename: {board.get('os_codename', 'unknown')}")
-        log_line("preflight", f"Architecture: {board.get('arch', 'unknown')}")
-        set_step("preflight", "done")
+        if not plan.get("preflight", True):
+            log_line("preflight", "Settings for this step didn't change, so it was skipped.")
+            set_step("preflight", "skipped")
+        else:
+            set_step("preflight", "running")
+            board = load_board_info()
+            log_line("preflight", f"Board: {board.get('model', 'unknown')}")
+            log_line("preflight", f"OS codename: {board.get('os_codename', 'unknown')}")
+            log_line("preflight", f"Architecture: {board.get('arch', 'unknown')}")
+            set_step("preflight", "done")
 
         # leds: general test screen, up front. A previous install leaves the
         # LED service running and holding the pins ("GPIO busy"), so stop it
         # first; the LED step starts it again at the end.
-        free_gpio_pins("leds_test")
-        set_step("leds_test", "running")
-        run_led_test_screen(cfg, "leds_test")
-        set_step("leds_test", "done")
+        if not plan.get("leds_test", True):
+            log_line("leds_test", "Settings for this step didn't change, so it was skipped.")
+            set_step("leds_test", "skipped")
+        else:
+            free_gpio_pins("leds_test")
+            set_step("leds_test", "running")
+            run_led_test_screen(cfg, "leds_test")
+            set_step("leds_test", "done")
 
         # wifi
-        set_step("wifi", "running")
-        apply_wifi_config(cfg, "wifi")
-        test_feature_led(cfg, "wifi", cfg["leds"]["pin_wifi"], "Wi-Fi")
-        set_step("wifi", "done")
+        if not plan.get("wifi", True):
+            log_line("wifi", "Settings for this step didn't change, so it was skipped.")
+            set_step("wifi", "skipped")
+        else:
+            set_step("wifi", "running")
+            apply_wifi_config(cfg, "wifi")
+            if plan.get("leds_test", True):
+                test_feature_led(cfg, "wifi", cfg["leds"]["pin_wifi"], "Wi-Fi")
+            set_step("wifi", "done")
 
         # storage
-        set_step("storage", "running")
-        chosen = next((d for d in get_storage_devices() if d["path"] == storage_device), None) if storage_device else None
-        if storage_device and not chosen:
-            raise StepFailed(f"The drive {storage_device} isn't available any more. Plug it in and run setup again.")
-        if chosen:
-            log_line("storage", f"Drive {chosen['path']}: " + (
-                f"has a usable ext4 partition ({chosen['ready_part']})" if chosen["ready_part"] else "no usable ext4 partition")
-                + f"; erase requested: {'yes' if format_device else 'no'}.")
-        if chosen and (format_device or not chosen["ready_part"]):
-            format_and_mount_device(chosen["path"], cfg["storage"]["media_root"], "storage")
-        elif chosen:
-            use_existing_device(chosen["ready_part"], cfg["storage"]["media_root"], "storage")
+        if not plan.get("storage", True):
+            log_line("storage", "Settings for this step didn't change, so it was skipped.")
+            set_step("storage", "skipped")
         else:
-            log_line("storage", "No device selected for formatting; using existing storage as-is.")
-            ensure_media_root(cfg["storage"]["media_root"], "storage")
-        set_step("storage", "done")
+            set_step("storage", "running")
+            chosen = next((d for d in get_storage_devices() if d["path"] == storage_device), None) if storage_device else None
+            if storage_device and not chosen:
+                raise StepFailed(f"The drive {storage_device} isn't available any more. Plug it in and run setup again.")
+            if chosen:
+                log_line("storage", f"Drive {chosen['path']}: " + (
+                    f"has a usable ext4 partition ({chosen['ready_part']})" if chosen["ready_part"] else "no usable ext4 partition")
+                    + f"; erase requested: {'yes' if format_device else 'no'}.")
+            if chosen and (format_device or not chosen["ready_part"]):
+                format_and_mount_device(chosen["path"], cfg["storage"]["media_root"], "storage")
+            elif chosen:
+                use_existing_device(chosen["ready_part"], cfg["storage"]["media_root"], "storage")
+            else:
+                log_line("storage", "No device selected for formatting; using existing storage as-is.")
+                ensure_media_root(cfg["storage"]["media_root"], "storage")
+            set_step("storage", "done")
 
         # docker
-        set_step("docker", "running")
-        ensure_docker("docker")
-        set_step("docker", "done")
+        if not plan.get("docker", True):
+            log_line("docker", "Settings for this step didn't change, so it was skipped.")
+            set_step("docker", "skipped")
+        else:
+            set_step("docker", "running")
+            ensure_docker("docker")
+            set_step("docker", "done")
 
         # apps
-        set_step("apps", "running")
-        compose_path = generate_docker_compose(cfg, "apps")
-        bring_up_apps(compose_path, "apps")
-        if cfg["apps"]["install_calibre_web"]:
-            test_feature_led(cfg, "apps", cfg["leds"]["pin_cweb"], "Calibre-Web")
-        if cfg["apps"]["install_audiobookshelf"]:
-            test_feature_led(cfg, "apps", cfg["leds"]["pin_abs"], "Audiobookshelf")
-        set_step("apps", "done")
+        if not plan.get("apps", True):
+            log_line("apps", "Settings for this step didn't change, so it was skipped.")
+            set_step("apps", "skipped")
+        else:
+            set_step("apps", "running")
+            compose_path = generate_docker_compose(cfg, "apps")
+            bring_up_apps(compose_path, "apps")
+            if cfg["apps"]["install_calibre_web"]:
+                if plan.get("leds_test", True):
+                    test_feature_led(cfg, "apps", cfg["leds"]["pin_cweb"], "Calibre-Web")
+            if cfg["apps"]["install_audiobookshelf"]:
+                if plan.get("leds_test", True):
+                    test_feature_led(cfg, "apps", cfg["leds"]["pin_abs"], "Audiobookshelf")
+            set_step("apps", "done")
 
         # accounts: create the patron login shown on the welcome page
-        set_step("accounts", "running")
-        provision_accounts(cfg, "accounts")
-        install_library_refresh(cfg, "accounts")
-        set_step("accounts", "done")
+        if not plan.get("accounts", True):
+            log_line("accounts", "Settings for this step didn't change, so it was skipped.")
+            set_step("accounts", "skipped")
+        else:
+            set_step("accounts", "running")
+            provision_accounts(cfg, "accounts")
+            install_library_refresh(cfg, "accounts")
+            set_step("accounts", "done")
 
         # requests page
-        set_step("requests_page", "running")
-        install_requests_page(cfg, "requests_page")
-        set_step("requests_page", "done")
+        if not plan.get("requests_page", True):
+            log_line("requests_page", "Settings for this step didn't change, so it was skipped.")
+            set_step("requests_page", "skipped")
+        else:
+            set_step("requests_page", "running")
+            install_requests_page(cfg, "requests_page")
+            set_step("requests_page", "done")
 
         # sync
-        set_step("sync", "running")
-        apply_sync_config(cfg, "sync")
-        set_step("sync", "done")
+        if not plan.get("sync", True):
+            log_line("sync", "Settings for this step didn't change, so it was skipped.")
+            set_step("sync", "skipped")
+        else:
+            set_step("sync", "running")
+            apply_sync_config(cfg, "sync")
+            set_step("sync", "done")
 
         # trigger
-        set_step("trigger", "running")
-        apply_sync_trigger(cfg, "trigger")
-        set_step("trigger", "done")
+        if not plan.get("trigger", True):
+            log_line("trigger", "Settings for this step didn't change, so it was skipped.")
+            set_step("trigger", "skipped")
+        else:
+            set_step("trigger", "running")
+            apply_sync_trigger(cfg, "trigger")
+            set_step("trigger", "done")
 
         # leds: install the persistent status-LED daemon last, now that
         # docker/app state it reports on actually exists
-        set_step("leds_service", "running")
-        install_led_service(cfg, "leds_service")
-        set_step("leds_service", "done")
+        if not plan.get("leds_service", True):
+            log_line("leds_service", "Settings for this step didn't change, so it was skipped.")
+            set_step("leds_service", "skipped")
+        else:
+            set_step("leds_service", "running")
+            install_led_service(cfg, "leds_service")
+            set_step("leds_service", "done")
 
         # shutdown button: tested and installed last of all, since its
         # script needs to know the final LED service name/pins
-        set_step("shutdown_button", "running")
-        setup_shutdown_button(cfg, "shutdown_button")
-        set_step("shutdown_button", "done")
+        if not plan.get("shutdown_button", True):
+            log_line("shutdown_button", "Settings for this step didn't change, so it was skipped.")
+            set_step("shutdown_button", "skipped")
+        else:
+            set_step("shutdown_button", "running")
+            setup_shutdown_button(cfg, "shutdown_button")
+            set_step("shutdown_button", "done")
 
         # qr codes: install qrcode just long enough to bake in the images
         # the welcome page needs, then remove it again
-        set_step("qr_codes", "running")
-        generate_and_cache_qr_codes(cfg, "qr_codes")
-        set_step("qr_codes", "done")
+        if not plan.get("qr_codes", True):
+            log_line("qr_codes", "Settings for this step didn't change, so it was skipped.")
+            set_step("qr_codes", "skipped")
+        else:
+            set_step("qr_codes", "running")
+            generate_and_cache_qr_codes(cfg, "qr_codes")
+            set_step("qr_codes", "done")
 
         # welcome page: generated last, once every feature's real on/off
         # state (apps, requests page, LEDs, shutdown button, accounts, QR
         # codes) is known
-        set_step("welcome_page", "running")
-        write_welcome_page(cfg, "welcome_page")
-        set_step("welcome_page", "done")
+        if not plan.get("welcome_page", True):
+            log_line("welcome_page", "Settings for this step didn't change, so it was skipped.")
+            set_step("welcome_page", "skipped")
+        else:
+            set_step("welcome_page", "running")
+            write_welcome_page(cfg, "welcome_page")
+            set_step("welcome_page", "done")
 
     except StepFailed as e:
         ok = False
@@ -3215,11 +3351,14 @@ def run_pipeline(cfg, storage_device, format_device):
                     steps[step_id] = "skipped"
         emit("log", step="pipeline", level="error", text=f"Unexpected error: {e}")
     finally:
+        if ok:
+            save_applied_snapshot(cfg)
         with STATE_LOCK:
             STATE["running"] = False
             STATE["finished"] = True
             STATE["ok"] = ok
-        emit("done", ok=ok)
+            reboot = STATE["needs_reboot"]
+        emit("done", ok=ok, needs_reboot=reboot)
 
 
 # ---------------------------------------------------------------------------
@@ -3536,6 +3675,9 @@ FORM_TEMPLATE = """
           <section class="step" data-title="Review &amp; install">
             <p class="step-intro">Check everything, then start. Tap <em>Edit</em> on any section to change it.</p>
             <div id="review"></div>
+            {% if installed_before %}
+            <label class="check" style="margin-top:12px"><input type="checkbox" name="rerun_all" value="1"><span>Re-run every step (repair). Normally only the steps for settings you changed run.</span></label>
+            {% endif %}
             <small>When setup finishes, a printable welcome page (also as a PDF) is generated with the logo, Wi-Fi info, the patron account and QR codes for what you installed.</small>
           </section>
 
@@ -4026,10 +4168,14 @@ function appendLine(text, cls) {
   c.scrollTop = c.scrollHeight;
 }
 
-function showBanner(ok) {
+function showBanner(ok, needsReboot) {
   const b = document.getElementById("banner");
   b.className = ok ? "ok" : "fail";
-  if (ok) {
+  if (ok && needsReboot === false) {
+    b.innerHTML = 'Settings applied. No reboot needed. ' +
+      '<a href="/monitor">Open the Monitor</a> &middot; ' +
+      '<a href="/welcome" target="_blank">View the welcome page</a>';
+  } else if (ok) {
     b.innerHTML = 'Setup finished successfully. ' +
       '<a href="/welcome" target="_blank">View the welcome page</a> &middot; ' +
       '<a href="/welcome.pdf" target="_blank">Download the printable PDF</a>' +
@@ -4087,7 +4233,7 @@ function connectStream() {
       applyBtn.textContent = "Apply & Set Up";
       editBtn.hidden = false;
       document.getElementById("confirm-overlay").style.display = "none";
-      showBanner(data.ok);
+      showBanner(data.ok, data.needs_reboot);
     } else if (data.kind === "start") {
       document.getElementById("console").innerHTML = "";
       document.getElementById("banner").className = "";
@@ -4115,6 +4261,7 @@ form.addEventListener("submit", async (e) => {
   const payload = {};
   for (const [k, v] of fd.entries()) payload[k] = v;
   payload.format_device = fd.has("format_device");
+  payload.rerun_all = fd.has("rerun_all");
   payload.install_audiobookshelf = fd.has("install_audiobookshelf");
   payload.install_calibre_web = fd.has("install_calibre_web");
   payload.requests_enabled = fd.has("requests_enabled");
@@ -4156,7 +4303,7 @@ fetch("/setup/state").then(r => r.json()).then(state => {
   } else if (state.finished) {
     showMode("progress");
     editBtn.hidden = false;
-    showBanner(state.ok);
+    showBanner(state.ok, state.needs_reboot);
   }
 });
 {% endraw %}
@@ -4181,6 +4328,7 @@ def setup():
     return render_template_string(
         FORM_TEMPLATE,
         cfg=cfg,
+        installed_before=load_applied_snapshot() is not None,
         devices=devices,
         board=board,
         step_order=STEP_ORDER,
@@ -4258,9 +4406,19 @@ def setup_apply():
     except (TypeError, ValueError):
         pass
 
+    # Which steps need to run? Compare with what the last successful run
+    # applied, so changing one setting doesn't redo the whole install.
+    old = load_applied_snapshot()
+    storage_changed = bool(format_device)
+    if storage_device and not storage_changed:
+        chosen = next((d for d in get_storage_devices() if d["path"] == storage_device), None)
+        if chosen and chosen.get("ready_mountpoint") != cfg["storage"]["media_root"]:
+            storage_changed = True
+    plan, needs_reboot = plan_changes(old, cfg, storage_changed=storage_changed, force_all=bool(data.get("rerun_all")))
+
     save_config(cfg)
 
-    thread = threading.Thread(target=run_pipeline, args=(cfg, storage_device, format_device), daemon=True)
+    thread = threading.Thread(target=run_pipeline, args=(cfg, storage_device, format_device, plan, needs_reboot), daemon=True)
     thread.start()
     return jsonify({"started": True})
 
@@ -4351,6 +4509,7 @@ def setup_state():
                 "running": STATE["running"],
                 "finished": STATE["finished"],
                 "ok": STATE["ok"],
+                "needs_reboot": STATE["needs_reboot"],
                 "steps": dict(STATE["steps"]),
                 "pending_confirm": pending_confirm,
             }

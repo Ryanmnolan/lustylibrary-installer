@@ -320,6 +320,8 @@ Once the first install has finished, the **setup wizard** is locked behind a pas
 
 - **Settings** has a **Start sync** button (needs the Ethernet cable plugged in, and says so if it isn't), a **hardware test** that flashes each LED and waits for a power-button press (the LED and button services pause during the test and restart afterwards), **Reboot** and **Shut down** buttons, and **Re-run setup** (asks for the password) to change the hotspot, drive, apps or sync settings.
 
+**Changing settings later.** When you re-run setup, only the steps for the settings you changed run. For example, adding auto-sync only redoes the sync steps, and a changed hotspot name or password is the only change that needs a reboot. Everything else takes effect right away. If something seems wrong, tick **Re-run every step (repair)** on the last screen to redo the whole install.
+
 ## Case & 3D print
 
 A 3D-printable insert for the LEDs, the shutdown button and an RJ45 keystone
