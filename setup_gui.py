@@ -2110,10 +2110,26 @@ def ensure_gpio_deps(step_id):
     return True
 
 
+def release_gpio():
+    """Lets go of every GPIO pin this process has claimed. The setup page is a
+    long-running service, so a LED or button object left open by a test (or
+    one that failed half-way) would keep the pin "busy" and stop the status LED
+    and shutdown-button services from starting. Safe to call at any time."""
+    try:
+        import gpiozero
+        factory = gpiozero.Device.pin_factory
+        if factory is not None:
+            factory.close()
+            gpiozero.Device.pin_factory = None
+    except Exception:  # noqa: BLE001 - best effort, never worth failing setup over
+        pass
+
+
 def free_gpio_pins(step_id):
     """Makes sure nothing from a previous install is holding the LED/button
     pins ("GPIO busy"): stops the status-LED and shutdown-button services and
     any leftover status_leds.py, then logs whoever still has the GPIO chip."""
+    release_gpio()
     for unit in ("lustylibrary-leds.service", "lustylibrary-shutdown-button.service"):
         run_cmd(["systemctl", "stop", unit], step_id, allow_fail=True)
     run_cmd(["pkill", "-f", "/usr/local/bin/status_leds.py"], step_id, allow_fail=True)
@@ -2142,6 +2158,7 @@ def blink_led(pin, step_id, label, times=3, on_time=0.2, off_time=0.2):
         return None
 
     log_line(step_id, f"Blinking {label} LED on GPIO{pin} ({times}x), then holding it on...")
+    led = None
     try:
         try:
             led = LED(pin)
@@ -2160,6 +2177,11 @@ def blink_led(pin, step_id, label, times=3, on_time=0.2, off_time=0.2):
         return led
     except Exception as e:  # noqa: BLE001 - bad wiring/pin shouldn't kill setup
         log_line(step_id, f"Could not drive GPIO{pin} ({label}): {e}", level="error")
+        if led is not None:
+            try:
+                led.close()
+            except Exception:  # noqa: BLE001
+                pass
         return None
 
 
@@ -3351,6 +3373,7 @@ def run_pipeline(cfg, storage_device, format_device, plan=None, needs_reboot=Tru
                     steps[step_id] = "skipped"
         emit("log", step="pipeline", level="error", text=f"Unexpected error: {e}")
     finally:
+        release_gpio()
         if ok:
             save_applied_snapshot(cfg)
         with STATE_LOCK:
