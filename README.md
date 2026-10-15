@@ -314,6 +314,9 @@ Here is an example of what it looks like (a real one, made by the installer):
 
 ---
 
+
+**Lid card.** ([Example PDF](docs/lusty-library-lid-card-example.pdf)) The welcome page also has a **Lid card (207 x 145 mm)** link. It is the same sheet cut to the exact size of the inside of the Apache 1800 case lid. Print it on plain paper at **Actual size / 100%** (not "Fit to page"), cut along the outline, and hold it on the cork with a push pin through each corner cross. It is also saved as `welcome-lid.pdf` in the media folder, and you can open it at `http://10.10.10.10:9000/welcome-lid.pdf`.
+
 ## Monitor & settings (after setup)
 
 Once the first install has finished, the **setup wizard** is locked behind a password: **`LustyLibrary`**. It's fixed and can't be changed, so treat it as a guard against accidental clicks, not real security. The **Monitor** and **Settings** pages are open to anyone on the Lusty Library Wi-Fi or your home network at `http://10.10.10.10:9000/monitor` (and `/settings`). The welcome sheet (`/welcome`) is public too.
