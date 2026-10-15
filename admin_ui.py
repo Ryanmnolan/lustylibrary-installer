@@ -279,6 +279,18 @@ def _t(line):
         TEST["lines"].append(line)
 
 
+def _release_gpio():
+    """Closes this process's GPIO handle so no pin stays claimed (a claimed
+    pin would stop the LED and button services from starting again)."""
+    try:
+        import gpiozero
+        if gpiozero.Device.pin_factory is not None:
+            gpiozero.Device.pin_factory.close()
+            gpiozero.Device.pin_factory = None
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _hardware_test(cfg):
     units = ("lustylibrary-leds.service", "lustylibrary-shutdown-button.service")
     try:
@@ -297,18 +309,25 @@ def _hardware_test(cfg):
             for label, pin in (("Wi-Fi", leds["pin_wifi"]), ("Calibre-Web", leds["pin_cweb"]),
                                ("Audiobookshelf", leds["pin_abs"])):
                 _t(f"Flashing the {label} LED (GPIO{pin})...")
+                led = None
                 try:
                     led = LED(pin)
                     for _ in range(3):
                         led.on(); time.sleep(0.35); led.off(); time.sleep(0.25)
-                    led.close()
                 except Exception as e:  # noqa: BLE001
                     _t(f"ERROR: couldn't drive GPIO{pin}: {e}")
+                finally:
+                    if led is not None:
+                        try:
+                            led.close()
+                        except Exception:  # noqa: BLE001
+                            pass
         else:
             _t("Status LEDs aren't enabled - skipping the LED test.")
         sb = cfg["shutdown_button"]
         if sb["enabled"]:
             _t(f"Now press the power button (GPIO{sb['pin']}) - you have 15 seconds. It will NOT shut the Pi down.")
+            btn = None
             try:
                 btn = Button(sb["pin"], pull_up=True)
                 if btn.wait_for_press(timeout=15):
@@ -316,12 +335,19 @@ def _hardware_test(cfg):
                     btn.wait_for_release(timeout=5)
                 else:
                     _t("No button press seen in 15 seconds. Check the wiring/pin.")
-                btn.close()
             except Exception as e:  # noqa: BLE001
                 _t(f"ERROR: couldn't read GPIO{sb['pin']}: {e}")
+            finally:
+                if btn is not None:
+                    try:
+                        btn.close()
+                    except Exception:  # noqa: BLE001
+                        pass
         else:
             _t("Power button isn't enabled - skipping the button test.")
     finally:
+        _release_gpio()
+        time.sleep(0.5)
         for u in units:
             _run(["systemctl", "start", u], timeout=20)
         _t("Status LEDs and power-button watcher restarted. Test finished.")
