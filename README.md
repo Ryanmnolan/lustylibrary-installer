@@ -312,10 +312,32 @@ Here is an example of what it looks like (a real one, made by the installer):
 
 [Download the example PDF](docs/lusty-library-welcome-example.pdf)
 
+### The lid card
+
+The welcome page also has a **Lid card (207 x 145 mm)** link. It's the same
+sheet, sized to fit exactly inside the lid of the Apache 1800 case, so the
+instructions are right there when someone opens the case.
+
+1. Open the welcome page and tap **Lid card**, or go to
+   `http://10.10.10.10:9000/welcome-lid.pdf`. It's also saved as
+   `welcome-lid.pdf` in the media folder.
+2. Print it on plain paper at **Actual size / 100%**, not "Fit to page".
+3. Cut along the thin outline.
+4. Pin it in the lid with a push pin through each corner cross.
+
+The pins need something to go into, so line the lid with a sheet of
+[cork board](https://a.co/d/07PERxeS) first (optional; see the
+[parts list](#parts-list)). Cut the cork to the same 207 x 145 mm and stick it
+to the flat area inside the lid. Without cork, double-sided tape works too.
+
+[Download the example lid card PDF](docs/lusty-library-lid-card-example.pdf)
+
+<p>
+  <img src="docs/images/lid-card-in-case.jpg" alt="The lid card pinned inside the case lid" width="380">
+  <img src="docs/images/lid-cork.jpg" alt="The cork lining inside the case lid, before the card goes on" width="380">
+</p>
+
 ---
-
-
-**Lid card.** ([Example PDF](docs/lusty-library-lid-card-example.pdf)) The welcome page also has a **Lid card (207 x 145 mm)** link. It is the same sheet cut to the exact size of the inside of the Apache 1800 case lid. Print it on plain paper at **Actual size / 100%** (not "Fit to page"), cut along the outline, and hold it on the cork with a push pin through each corner cross. It is also saved as `welcome-lid.pdf` in the media folder, and you can open it at `http://10.10.10.10:9000/welcome-lid.pdf`.
 
 ## Monitor & settings (after setup)
 
@@ -358,6 +380,8 @@ a soldering iron. Print settings: PLA, 20% infill.
 | 1 | [12 mm momentary push button](https://a.co/d/0ajX9YHT) | The safe-shutdown button |
 | 1 | RJ45 keystone jack | Lets you plug the network cable in from outside the case |
 | - | Jumper wires, solder | To connect the LEDs and button to the Pi's header |
+| 1 | [Cork board sheet](https://a.co/d/07PERxeS) (optional) | Lines the lid so the [lid card](#the-lid-card) can be pinned in. Cut to 207 x 145 mm |
+| 4 | Push pins (optional) | One through each corner cross of the lid card |
 
 The LEDs and the button are optional. Turn them on in the wizard's Hardware screen.
 
