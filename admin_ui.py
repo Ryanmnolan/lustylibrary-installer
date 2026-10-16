@@ -291,13 +291,58 @@ def _release_gpio():
         pass
 
 
+GPIO_SCRIPTS = ("/usr/local/bin/status_leds.py", "/usr/local/bin/shutdown_button.py")
+
+
+def _gpio_holders(pin):
+    """Best-effort answer to "who has this pin?" for the test output: the
+    kernel's line info for the pin (gpioinfo shows the consumer label), any
+    process with a GPIO chip open (fuser), and any config.txt overlay that
+    claims GPIO pins in the kernel (gpio-shutdown / gpio-key)."""
+    found = []
+    if shutil.which("gpioinfo"):
+        _, out = _run(["gpioinfo"], timeout=10)
+        found += [ln.strip() for ln in out.splitlines() if f'"GPIO{pin}"' in ln]
+    if shutil.which("fuser"):
+        _, out = _run(["bash", "-c", "fuser -v /dev/gpiochip* 2>&1"], timeout=10)
+        found += [ln.rstrip() for ln in out.splitlines() if ln.strip() and "USER" not in ln]
+    for cfg_txt in ("/boot/firmware/config.txt", "/boot/config.txt"):
+        try:
+            for ln in Path(cfg_txt).read_text().splitlines():
+                s = ln.strip()
+                if s.startswith("dtoverlay=") and ("gpio-shutdown" in s or "gpio-key" in s):
+                    found.append(f"{cfg_txt}: {s}")
+        except OSError:
+            pass
+    return found
+
+
+def _open_button(pin, Button):
+    """Opens the button pin, retrying a couple of times on 'GPIO busy': a
+    just-stopped service can take a moment to let go of the pin."""
+    last = None
+    for attempt in range(3):
+        try:
+            return Button(pin, pull_up=True)
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if "busy" not in str(e).lower():
+                raise
+            _release_gpio()
+            _run(["pkill", "-f", GPIO_SCRIPTS[1]])
+            time.sleep(1.0 + attempt)
+    raise last
+
+
 def _hardware_test(cfg):
     units = ("lustylibrary-leds.service", "lustylibrary-shutdown-button.service")
     try:
         _t("Pausing the status LEDs and the power-button watcher...")
+        _release_gpio()  # in case this process still has a pin from earlier
         for u in units:
             _run(["systemctl", "stop", u], timeout=20)
-        _run(["pkill", "-f", "/usr/local/bin/status_leds.py"])
+        for script in GPIO_SCRIPTS:
+            _run(["pkill", "-f", script])
         time.sleep(0.8)
         try:
             from gpiozero import LED, Button
@@ -329,7 +374,7 @@ def _hardware_test(cfg):
             _t(f"Now press the power button (GPIO{sb['pin']}) - you have 15 seconds. It will NOT shut the Pi down.")
             btn = None
             try:
-                btn = Button(sb["pin"], pull_up=True)
+                btn = _open_button(sb["pin"], Button)
                 if btn.wait_for_press(timeout=15):
                     _t("Button press detected - the button works.")
                     btn.wait_for_release(timeout=5)
@@ -337,6 +382,14 @@ def _hardware_test(cfg):
                     _t("No button press seen in 15 seconds. Check the wiring/pin.")
             except Exception as e:  # noqa: BLE001
                 _t(f"ERROR: couldn't read GPIO{sb['pin']}: {e}")
+                if "busy" in str(e).lower():
+                    _t(f"Something else is still using GPIO{sb['pin']}. What has it:")
+                    holders = _gpio_holders(sb["pin"])
+                    for ln in holders or ["(couldn't tell - try 'sudo gpioinfo' over SSH)"]:
+                        _t("  " + ln)
+                    if any("gpio-shutdown" in ln or "gpio-key" in ln for ln in holders):
+                        _t("A dtoverlay line in config.txt gives a GPIO pin to the kernel. If it uses "
+                           f"GPIO{sb['pin']}, remove that line and reboot.")
             finally:
                 if btn is not None:
                     try:
