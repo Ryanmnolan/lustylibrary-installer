@@ -31,7 +31,7 @@ CONTAINERS = [("audiobookshelf", "Audiobookshelf"), ("calibre-web-automated", "C
 # Pages/endpoints that work without logging in. Only the setup wizard (and its
 # /setup/... actions) is password-protected after the first install; Monitor and
 # Settings are open.
-PUBLIC_ENDPOINTS = {"login", "logout", "welcome", "welcome_pdf", "static",
+PUBLIC_ENDPOINTS = {"login", "logout", "welcome", "welcome_pdf", "welcome_lid_pdf", "static",
                     "monitor", "settings", "api_status", "admin_sync", "admin_reboot",
                     "admin_shutdown", "admin_hardware_test"}
 # Needed to finish the very first install (reboot button etc.) in the same

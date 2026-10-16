@@ -2631,6 +2631,7 @@ WantedBy=multi-user.target
 
 WELCOME_HTML_NAME = "welcome.html"
 WELCOME_PDF_NAME = "welcome.pdf"
+LID_PDF_NAME = "welcome-lid.pdf"
 
 # Generic, always-correct app-store search links (rather than a specific app
 # ID we can't fully verify), so the QR code always lands somewhere useful.
@@ -2790,6 +2791,7 @@ WELCOME_PAGE_TEMPLATE = '''
   <div class="toolbar">
     <button type="button" onclick="window.print()">Print</button>
     <a href="/welcome.pdf" target="_blank">Download PDF</a>
+    <a href="/welcome-lid.pdf" target="_blank">Lid card (207 x 145 mm)</a>
   </div>
   <div id="stage"><div class="sheet">
     <div class="head">
@@ -2970,10 +2972,13 @@ def _data_uri_to_buf(data_uri):
         return None
 
 
-def render_welcome_pdf_bytes(cfg):
-    """Builds the welcome sign as a landscape US-Letter PDF directly with
-    reportlab (no HTML rendering step involved), from the same context as
-    the on-screen welcome page, so the two always agree on content."""
+def _build_welcome_pdf(cfg, real_page=None, scale=1.0, marks=False):
+    """Builds the welcome sign directly with reportlab (no HTML rendering
+    step involved), from the same context as the on-screen welcome page, so
+    the two always agree on content. By default it's a landscape US-Letter
+    page. With real_page=(w, h) in points the sheet is that exact size: the
+    layout is drawn on a virtual page 1/scale times bigger and scaled down, so
+    everything shrinks together. Returns (pdf_bytes, page_count)."""
     from xml.sax.saxutils import escape
 
     from reportlab.lib import colors
@@ -2985,7 +2990,12 @@ def render_welcome_pdf_bytes(cfg):
     )
 
     ctx = _welcome_context(cfg)
-    page_w, page_h = landscape(LETTER)
+    if real_page:
+        real_w, real_h = real_page
+        page_w, page_h = real_w / scale, real_h / scale
+    else:
+        page_w, page_h = landscape(LETTER)
+        real_w, real_h = page_w, page_h
     margin = 36
     gap = 28
     col_w = (page_w - 2 * margin - gap) / 2
@@ -3128,17 +3138,59 @@ def render_welcome_pdf_bytes(cfg):
                        "Once all LEDs are off, unplug from the wall."))
 
     buf = io.BytesIO()
-    doc = BaseDocTemplate(buf, pagesize=(page_w, page_h), leftMargin=margin, rightMargin=margin,
+    doc = BaseDocTemplate(buf, pagesize=(real_w, real_h), leftMargin=margin, rightMargin=margin,
                           topMargin=margin, bottomMargin=margin, title="Lusty Library Connection Instructions")
+
+    def on_page(canv, _doc):
+        if marks:
+            # a thin outline plus a small cross near each corner, where a pin goes
+            canv.saveState()
+            canv.setStrokeColor(colors.HexColor("#999999"))
+            canv.setLineWidth(0.5)
+            canv.rect(0.5, 0.5, real_w - 1, real_h - 1)
+            inset, arm = 17, 4  # points (about 6 mm in, 1.4 mm arms)
+            for x in (inset, real_w - inset):
+                for y in (inset, real_h - inset):
+                    canv.line(x - arm, y, x + arm, y)
+                    canv.line(x, y - arm, x, y + arm)
+            canv.restoreState()
+        if scale != 1.0:
+            canv.scale(scale, scale)
     body_h = page_h - 2 * margin - head_h
     frames = [
         Frame(margin, page_h - margin - head_h, page_w - 2 * margin, head_h, id="head", leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0),
         Frame(margin, margin, col_w, body_h, id="left", leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0),
         Frame(margin + col_w + gap, margin, col_w, body_h, id="right", leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0),
     ]
-    doc.addPageTemplates([PageTemplate(id="sign", frames=frames)])
+    doc.addPageTemplates([PageTemplate(id="sign", frames=frames, onPage=on_page)])
     doc.build(story)
-    return buf.getvalue()
+    return buf.getvalue(), doc.page
+
+
+def render_welcome_pdf_bytes(cfg):
+    return _build_welcome_pdf(cfg)[0]
+
+
+# The inside of the Apache 1800 lid: 207 x 145 mm of flat cork.
+LID_CARD_MM = (207, 145)
+
+
+def render_lid_card_pdf_bytes(cfg):
+    """The welcome sign cut to the exact size of the case lid (207 x 145 mm),
+    for printing on plain paper at 100%. Picks the largest text size that
+    still fits on the one page."""
+    mm = 72 / 25.4
+    real = (LID_CARD_MM[0] * mm, LID_CARD_MM[1] * mm)
+    last = None
+    for step in range(76, 49, -1):  # 0.76 down to 0.50
+        try:
+            data, pages = _build_welcome_pdf(cfg, real_page=real, scale=step / 100, marks=True)
+        except Exception as e:  # noqa: BLE001 - too big at this size; try smaller
+            last = e
+            continue
+        if pages == 1:
+            return data
+    raise RuntimeError(f"couldn't fit the lid card on one page ({last})")
 
 
 def write_welcome_page(cfg, step_id):
@@ -3159,6 +3211,13 @@ def write_welcome_page(cfg, step_id):
         log_line(step_id, f"writing {out_pdf}")
     except Exception as e:  # noqa: BLE001 - the HTML page still works without a PDF
         log_line(step_id, f"Couldn't generate the printable PDF: {e}", level="error")
+
+    try:
+        out_lid = Path(media_root) / LID_PDF_NAME
+        out_lid.write_bytes(render_lid_card_pdf_bytes(cfg))
+        log_line(step_id, f"writing {out_lid}")
+    except Exception as e:  # noqa: BLE001
+        log_line(step_id, f"Couldn't generate the lid card PDF: {e}", level="error")
 
     log_line(
         step_id,
@@ -4497,6 +4556,19 @@ def welcome_pdf():
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": f"Couldn't generate the PDF: {e}"}), 500
     return Response(pdf_bytes, mimetype="application/pdf")
+
+
+@app.route("/welcome-lid.pdf")
+def welcome_lid_pdf():
+    """The welcome sign sized to fit the case lid; print at 100% (actual size)."""
+    cfg = load_config()
+    saved = Path(cfg["storage"]["media_root"]) / LID_PDF_NAME
+    if saved.exists():
+        return send_file(saved, mimetype="application/pdf", download_name="lusty-library-lid-card.pdf")
+    try:
+        return Response(render_lid_card_pdf_bytes(cfg), mimetype="application/pdf")
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": f"Couldn't generate the lid card: {e}"}), 500
 
 
 @app.route("/setup/reboot", methods=["POST"])
