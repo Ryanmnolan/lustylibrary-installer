@@ -2132,7 +2132,8 @@ def free_gpio_pins(step_id):
     release_gpio()
     for unit in ("lustylibrary-leds.service", "lustylibrary-shutdown-button.service"):
         run_cmd(["systemctl", "stop", unit], step_id, allow_fail=True)
-    run_cmd(["pkill", "-f", "/usr/local/bin/status_leds.py"], step_id, allow_fail=True)
+    for script in ("/usr/local/bin/status_leds.py", "/usr/local/bin/shutdown_button.py"):
+        run_cmd(["pkill", "-f", script], step_id, allow_fail=True)
     time.sleep(0.7)
     if shutil.which("fuser"):
         holders = subprocess.run(
