@@ -28,6 +28,17 @@ The best part? The whole thing is built around a small case from Harbor Freight,
 
 It's been a fun project to build, improve, and watch everyone enjoy. I'm excited to finally share The Lusty Library with you!
 
+## The finished case
+
+![The finished Lusty Library in its case](docs/images/finished-case.jpg)
+
+This is how it ends up: the Pi lives in a Harbor Freight Apache 1800 case, held
+by a 3D-printed insert with three status LEDs, a shutdown button and an RJ45
+keystone for the Ethernet sync. The power cable coils up in the base, and a
+printed instruction card (Wi-Fi, QR codes and the LED guide) sits in the lid.
+The insert is on [Printables](https://www.printables.com/model/1856982-lusty-library-case-insert),
+and the card is generated from your own settings (see [Case & 3D print](#case--3d-print)).
+
 ## What you get
 
 - A **Wi-Fi hotspot** (name, password and IP are yours to choose)
